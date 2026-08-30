@@ -4,9 +4,9 @@
   "description": "Nest TypeScript starter repository",
   "license": "MIT",
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "build:dev": "nest build --watch --webpack --webpackPath webpack-hmr.config.cjs",
-    "start": "node dist/main",
+    "build": "node init && tsc -p tsconfig.build.json",
+    "build:dev": "node init && nest build --watch --webpack --webpackPath webpack-hmr.config.cjs",
+    "start": "node init && node dist/main",
     "lint": "oxlint src --fix",
     "test": "echo 'No tests implemented yet.'",
     "test:e2e": "vitest run --config ./vitest.config.e2e.mts"

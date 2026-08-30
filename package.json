@@ -18,7 +18,7 @@
   ],
   "author": "Kamil Mysliwiec",
   "scripts": {
-    "build": "tsc -b -v packages",
+    "build": "node api.js && tsc -b -v packages",
     "postbuild": "npm run move:node_modules",
     "build:dev": "tsc -b -v packages --watch",
     "prebuild:prod": "npm run clean",

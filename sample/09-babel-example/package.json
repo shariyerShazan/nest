@@ -6,10 +6,10 @@
   "scripts": {
     "format": "prettier --write \"**/*.js\"",
     "prebuild": "rimraf dist",
-    "build": "babel src -d dist",
-    "start": "npm run build && node dist/main.js",
-    "start:dev": "nodemon",
-    "start:prod": "node dist/main.js",
+    "build": "node init && babel src -d dist",
+    "start": "node init && npm run build && node dist/main.js",
+    "start:dev": "node init && nodemon",
+    "start:prod": "node init && node dist/main.js",
     "test": "vitest run",
     "test:cov": "vitest run --coverage",
     "test:e2e": "vitest run --config ./vitest.config.e2e.mts"

@@ -9,10 +9,10 @@ import {
   fromEvent,
   lastValueFrom,
 } from 'rxjs';
-import { catchError, takeUntil } from 'rxjs/operators';
+import { catchError, finalize, takeUntil, throwIfEmpty } from 'rxjs/operators';
 import { GRPC_DEFAULT_PROTO_LOADER, GRPC_DEFAULT_URL } from '../constants.js';
 import { GrpcMethodStreamingType } from '../decorators/index.js';
-import { Transport } from '../enums/index.js';
+import { GrpcStatus, Transport } from '../enums/index.js';
 import { InvalidGrpcPackageException } from '../errors/invalid-grpc-package.exception.js';
 import { InvalidProtoDefinitionException } from '../errors/invalid-proto-definition.exception.js';
 import { ChannelOptions } from '../external/grpc-options.interface.js';
@@ -48,6 +48,21 @@ interface GrpcCall<TRequest = any, TMetadata = any> {
   on: Function;
   off: Function;
   emit: Function;
+  cancelled?: boolean;
+}
+
+// Calls on which the server is emitting a response error. The call is also
+// the emitter of the request stream's errors, so the listener on the request
+// side uses this to tell the two apart.
+const callsEmittingResponseError = new WeakSet<GrpcCall>();
+
+function emitResponseError(call: GrpcCall, err: unknown) {
+  callsEmittingResponseError.add(call);
+  try {
+    call.emit('error', err);
+  } finally {
+    callsEmittingResponseError.delete(call);
+  }
 }
 
 /**
@@ -292,38 +307,37 @@ export class ServerGrpc extends Server<never, never> {
 
   public createUnaryServiceMethod(methodHandler: Function): Function {
     return async (call: GrpcCall, callback: Function) => {
-      return this.onProcessingStartHook(
-        this.transportId,
+      return this.runWithProcessingHooks(
         { ...call, operationId: methodHandler.name } as any,
-        async () => {
+        async runEndHook => {
           const handler = methodHandler(call.request, call.metadata, call);
-          this.transformToObservable(await handler).subscribe({
-            next: async data => callback(null, await data),
-            error: (err: any) => {
-              this.onProcessingEndHook?.(this.transportId, call.request);
-              callback(err);
-            },
-            complete: () => {
-              this.onProcessingEndHook?.(this.transportId, call.request);
-            },
-          });
+          this.transformToObservable(await handler)
+            .pipe(
+              throwIfEmpty(() => this.createNoResponseError()),
+              finalize(runEndHook),
+            )
+            .subscribe({
+              next: async data => callback(null, await data),
+              error: (err: any) => callback(err),
+            });
         },
+        call.request,
       );
     };
   }
 
   public createStreamServiceMethod(methodHandler: Function): Function {
     return async (call: GrpcCall, callback: Function) => {
-      return this.onProcessingStartHook(
-        this.transportId,
+      return this.runWithProcessingHooks(
         { ...call, operationId: methodHandler.name } as any,
-        async () => {
+        async runEndHook => {
           const handler = methodHandler(call.request, call.metadata, call);
           const result$ = this.transformToObservable(await handler);
           await this.writeObservableToGrpc(result$, call);
 
-          this.onProcessingEndHook?.(this.transportId, call.request);
+          runEndHook();
         },
+        call.request,
       );
     };
   }
@@ -356,6 +370,11 @@ export class ServerGrpc extends Server<never, never> {
     // This promise should **not** reject, as we're handling errors in the observable for the Call
     // the promise is only needed to signal when writing/draining has been completed
     return new Promise((resolve, _doNotUse) => {
+      if (call.cancelled) {
+        // The client is already gone, and the "cancelled" event that would
+        // settle this promise has fired before we could listen for it.
+        return resolve();
+      }
       const valuesWaitingToBeDrained: T[] = [];
       let shouldErrorAfterDraining = false;
       let error: any;
@@ -397,7 +416,7 @@ export class ServerGrpc extends Server<never, never> {
           subscription.unsubscribe();
           resolve();
         } else if (shouldErrorAfterDraining) {
-          call.emit('error', error);
+          emitResponseError(call, error);
           subscription.unsubscribe();
           resolve();
         }
@@ -422,7 +441,7 @@ export class ServerGrpc extends Server<never, never> {
             if (valuesWaitingToBeDrained.length === 0) {
               // We're not waiting for a drain event, so we can just
               // reject and teardown.
-              call.emit('error', err);
+              emitResponseError(call, err);
               subscription.unsubscribe();
               resolve();
             } else {
@@ -455,61 +474,77 @@ export class ServerGrpc extends Server<never, never> {
       call: GrpcCall,
       callback: (err: unknown, value: unknown) => void,
     ) => {
-      return this.onProcessingStartHook(
-        this.transportId,
+      return this.runWithProcessingHooks(
         { ...call, operationId: methodHandler.name } as any,
-        async () => {
+        async runEndHook => {
           // Needs to be a Proxy in order to buffer messages that come before handler is executed
           // This could happen if handler has any async guards or interceptors registered that would delay
           // the execution.
-          const { subject, next, error, complete, cleanup } =
-            this.bufferUntilDrained();
+          const { subject, next, error, complete } = this.bufferUntilDrained();
           call.on('data', (m: any) => next(m));
           call.on('error', (e: any) => {
+            // The response error emitted by this server on the same call
+            // is not an error of the request stream
+            if (callsEmittingResponseError.has(call)) {
+              return;
+            }
             // Check if error means that stream ended on other end
             const isCancelledError = String(e)
               .toLowerCase()
               .indexOf('cancelled');
 
             if (isCancelledError !== -1) {
+              complete();
               call.end();
               return;
             }
             // If another error then just pass it along
             error(e);
           });
-          call.on('end', () => {
-            complete();
-            cleanup();
+          // grpc-js reports a client cancellation or an expired deadline
+          // through this event alone (no "error", and for a deadline no
+          // "end"), so the request stream has to be settled here for a
+          // handler that is still consuming it.
+          call.on(CANCELLED_EVENT, () => complete());
+          call.on('end', () => complete());
 
-            this.onProcessingEndHook?.(this.transportId, call.request);
-          });
-
-          const handler = methodHandler(
-            subject.asObservable(),
-            call.metadata,
-            call,
-          );
-          const res = this.transformToObservable(await handler);
-          if (isResponseStream) {
-            await this.writeObservableToGrpc(res, call);
-          } else {
-            const response = await lastValueFrom(
-              res.pipe(
-                takeUntil(fromEvent(call as any, CANCELLED_EVENT)),
-                catchError(err => {
-                  callback(err, null);
-                  return EMPTY;
-                }),
-                defaultIfEmpty(undefined),
-              ),
+          try {
+            const handler = methodHandler(
+              subject.asObservable(),
+              call.metadata,
+              call,
             );
+            const res = this.transformToObservable(await handler);
+            if (isResponseStream) {
+              await this.writeObservableToGrpc(res, call);
+            } else {
+              let errored = false;
+              const response = await lastValueFrom(
+                res.pipe(
+                  // Ahead of "takeUntil", which completes the stream when the
+                  // call is cancelled.
+                  throwIfEmpty(() => this.createNoResponseError()),
+                  takeUntil(fromEvent(call as any, CANCELLED_EVENT)),
+                  catchError(err => {
+                    errored = true;
+                    callback(err, null);
+                    return EMPTY;
+                  }),
+                  defaultIfEmpty(undefined),
+                ),
+              );
 
-            if (!isUndefined(response)) {
-              callback(null, response);
+              if (!errored && !call.cancelled) {
+                callback(null, response);
+              }
             }
+          } finally {
+            // The span closes when the handler is done, not when the client
+            // stops sending.
+            runEndHook();
           }
         },
+        call.request,
       );
     };
   }
@@ -522,25 +557,43 @@ export class ServerGrpc extends Server<never, never> {
       call: GrpcCall,
       callback: (err: unknown, value: unknown) => void,
     ) => {
-      return this.onProcessingStartHook(
-        this.transportId,
+      return this.runWithProcessingHooks(
         { ...call, operationId: methodHandler.name } as any,
-        async () => {
-          let handlerStream: Observable<any>;
-          if (isResponseStream) {
-            handlerStream = this.transformToObservable(
-              await methodHandler(call),
-            );
-          } else {
-            handlerStream = this.transformToObservable(
-              await methodHandler(call, callback),
-            );
+        async runEndHook => {
+          try {
+            let handlerStream: Observable<any>;
+            if (isResponseStream) {
+              handlerStream = this.transformToObservable(
+                await methodHandler(call),
+              );
+            } else {
+              handlerStream = this.transformToObservable(
+                await methodHandler(call, callback),
+              );
+            }
+            await lastValueFrom(handlerStream.pipe(finalize(runEndHook)), {
+              defaultValue: undefined,
+            });
+          } catch (err) {
+            // grpc-js ignores the promise returned here, so a rejection would
+            // go unhandled and the client would never learn about the error.
+            runEndHook();
+            if (isResponseStream) {
+              call.emit('error', err);
+            } else {
+              callback(err, null);
+            }
           }
-          await lastValueFrom(handlerStream).finally(() => {
-            this.onProcessingEndHook?.(this.transportId, call.request);
-          });
         },
+        call.request,
       );
+    };
+  }
+
+  private createNoResponseError() {
+    return {
+      code: GrpcStatus.INTERNAL,
+      details: 'The handler completed without emitting a response',
     };
   }
 
@@ -624,9 +677,16 @@ export class ServerGrpc extends Server<never, never> {
   public lookupPackage(root: any, packageName: string) {
     /** Reference: https://github.com/kondi/rxjs-grpc */
     let pkg = root;
-    for (const name of packageName.split(/\./)) {
-      pkg = pkg[name];
+
+    if (packageName) {
+      for (const name of packageName.split(/\./)) {
+        if (!pkg) {
+          break;
+        }
+        pkg = pkg[name];
+      }
     }
+
     return pkg;
   }
 
@@ -749,8 +809,8 @@ export class ServerGrpc extends Server<never, never> {
 
       // Replay buffered values to the new subscriber
       setImmediate(() => {
-        const subcription = replayBuffer!.subscribe(subject);
-        subcription.unsubscribe();
+        const subscription = replayBuffer!.subscribe(subject);
+        subscription.unsubscribe();
         replayBuffer = null;
       });
     }
@@ -783,26 +843,19 @@ export class ServerGrpc extends Server<never, never> {
         subject.next(value);
       },
       error: (err: any) => {
-        if (!hasDrained) {
-          replayBuffer!.error(err);
-        }
+        replayBuffer?.error(err);
         subject.error(err);
       },
       complete: () => {
-        if (!hasDrained) {
-          replayBuffer!.complete();
-          // Replay buffer is no longer needed
-          // Return early to allow subject to complete later, after the replay buffer
-          // has been drained
+        if (replayBuffer) {
+          // The subject completes once the buffer has been replayed into it,
+          // which "drainBuffer" does after the handler has subscribed. The
+          // buffer is kept until then: dropping it here would leave a handler
+          // that has not run yet without its messages and without completion.
+          replayBuffer.complete();
           return;
         }
         subject.complete();
-      },
-      cleanup: () => {
-        if (hasDrained) {
-          return;
-        }
-        replayBuffer = null;
       },
     };
   }

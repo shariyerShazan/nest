@@ -47,6 +47,7 @@ export class WebSocketsController {
     new MetadataScanner(),
   );
   private readonly exceptionFiltersCache = new WeakMap();
+  private readonly pendingDisconnects = new WeakMap<ContextId, number>();
 
   constructor(
     private readonly socketServerProvider: SocketServerProvider,
@@ -98,6 +99,7 @@ export class WebSocketsController {
           id: targetInstanceWrapperId,
           isDependencyTreeStatic: () => true,
           isDependencyTreeDurable: () => false,
+          getEnhancersMetadata: (): InstanceWrapper[] => [],
         } as InstanceWrapper<NestGateway>);
     const gatewayMetatype = metatype ?? instance.constructor;
     const options = Reflect.getMetadata(GATEWAY_OPTIONS, gatewayMetatype) || {};
@@ -145,29 +147,32 @@ export class WebSocketsController {
             id: instanceWrapperId,
             isDependencyTreeStatic: () => true,
             isDependencyTreeDurable: () => false,
+            getEnhancersMetadata: (): InstanceWrapper[] => [],
           } as InstanceWrapper<NestGateway>);
     const { instance } = instanceWrapper;
     const nativeMessageHandlers = this.metadataExplorer.explore(instance);
     const isStatic = instanceWrapper.isDependencyTreeStatic();
+    const hasGlobalScopedEnhancers = this.getGlobalScopedEnhancers().length > 0;
     const moduleRef = this.container.getModuleByKey(moduleKey)!;
     const messageHandlers = nativeMessageHandlers.map(
       ({ callback, isAckHandledManually, message, methodName }) => ({
         message,
         methodName,
-        callback: isStatic
-          ? this.contextCreator.create(
-              instance,
-              callback,
-              moduleKey,
-              methodName,
-              STATIC_CONTEXT,
-            )
-          : this.createRequestScopedHandler(
-              instanceWrapper,
-              moduleRef,
-              moduleKey,
-              methodName,
-            ),
+        callback:
+          isStatic && !hasGlobalScopedEnhancers
+            ? this.contextCreator.create(
+                instance,
+                callback,
+                moduleKey,
+                methodName,
+                STATIC_CONTEXT,
+              )
+            : this.createRequestScopedHandler(
+                instanceWrapper,
+                moduleRef,
+                moduleKey,
+                methodName,
+              ),
         isAckHandledManually,
       }),
     );
@@ -200,7 +205,7 @@ export class WebSocketsController {
             'handleConnection',
             observableServer.server,
           ),
-      isStatic
+      isStatic && !hasGlobalScopedEnhancers
         ? instance.handleDisconnect?.bind(instance)
         : this.createRequestScopedEventHandler(
             instanceWrapper,
@@ -373,7 +378,14 @@ export class WebSocketsController {
   ) {
     const { instance } = instanceWrapper;
     const collection = moduleRef.providers;
-    const isTreeDurable = instanceWrapper.isDependencyTreeDurable();
+    const isStatic = instanceWrapper.isDependencyTreeStatic();
+    const isTreeDurable = isStatic
+      ? this.areGlobalScopedEnhancersDurable()
+      : instanceWrapper.isDependencyTreeDurable();
+    const scopedEnhancers = [
+      ...(isStatic ? instanceWrapper.getEnhancersMetadata() || [] : []),
+      ...this.getGlobalScopedEnhancers(),
+    ];
 
     return async (...args: unknown[]) => {
       const [client] = args;
@@ -383,11 +395,21 @@ export class WebSocketsController {
           client as Record<any, any>,
           isTreeDurable,
         );
-        const contextInstance = await this.injector.loadPerContext(
-          instance,
-          moduleRef,
-          collection,
+        const contextInstance = isStatic
+          ? instance
+          : await this.injector.loadPerContext(
+              instance,
+              moduleRef,
+              collection,
+              contextId,
+            );
+        // Resolve global enhancers without adding them to the gateway's dependency
+        // tree, so a singleton gateway keeps its state and lifecycle hooks.
+        await this.injector.loadEnhancersPerContext(
+          instanceWrapper,
           contextId,
+          instanceWrapper,
+          scopedEnhancers,
         );
         return this.contextCreator.create(
           contextInstance,
@@ -425,7 +447,10 @@ export class WebSocketsController {
   ) {
     const { instance } = instanceWrapper;
     const collection = moduleRef.providers;
-    const isTreeDurable = instanceWrapper.isDependencyTreeDurable();
+    const isStatic = instanceWrapper.isDependencyTreeStatic();
+    const isTreeDurable = isStatic
+      ? this.areGlobalScopedEnhancersDurable()
+      : instanceWrapper.isDependencyTreeDurable();
     const targetCallback = instance[methodName];
 
     return async (...args: unknown[]) => {
@@ -437,17 +462,26 @@ export class WebSocketsController {
           client as Record<any, any>,
           isTreeDurable,
         );
-        const contextInstance = await this.injector.loadPerContext(
-          instance,
-          moduleRef,
-          collection,
-          contextId,
-        );
-        this.assignServerToProperties(contextInstance, server);
+        if (methodName === 'handleDisconnect') {
+          this.pendingDisconnects.set(
+            contextId,
+            (this.pendingDisconnects.get(contextId) ?? 0) + 1,
+          );
+        }
+        const contextInstance = isStatic
+          ? instance
+          : await this.injector.loadPerContext(
+              instance,
+              moduleRef,
+              collection,
+              contextId,
+            );
+        if (!isStatic) {
+          this.assignServerToProperties(contextInstance, server);
+        }
         const scopedMethod = contextInstance[methodName] as
-          | ((...methodArgs: unknown[]) => unknown)
-          | undefined;
-        return scopedMethod?.apply(contextInstance, args);
+          ((...methodArgs: unknown[]) => unknown) | undefined;
+        return await scopedMethod?.apply(contextInstance, args);
       } catch (err) {
         if (!targetCallback) {
           throw err;
@@ -476,6 +510,27 @@ export class WebSocketsController {
     };
   }
 
+  // A default-scoped gateway is resolved per connection only for its global
+  // scoped enhancers, so their trees decide whether the context is durable
+  // (mirrors InstanceWrapper#isDependencyTreeDurable).
+  private areGlobalScopedEnhancersDurable(): boolean {
+    const scopedEnhancers = this.getGlobalScopedEnhancers().filter(
+      wrapper => !wrapper.isDependencyTreeStatic(),
+    );
+    return (
+      scopedEnhancers.length > 0 &&
+      scopedEnhancers.every(wrapper => wrapper.isDependencyTreeDurable())
+    );
+  }
+
+  private getGlobalScopedEnhancers(): InstanceWrapper[] {
+    return [
+      ...this.config.getGlobalRequestGuards(),
+      ...this.config.getGlobalRequestPipes(),
+      ...this.config.getGlobalRequestInterceptors(),
+    ];
+  }
+
   public getContextId<T extends Record<any, unknown> = any>(
     request: T,
     isTreeDurable: boolean,
@@ -499,10 +554,20 @@ export class WebSocketsController {
 
   private cleanupRequestScopedContext(
     _instanceWrapper: InstanceWrapper<NestGateway>,
-    _contextId: ContextId,
+    contextId: ContextId,
     request: Record<any, any>,
   ) {
-    Reflect.deleteProperty(request, REQUEST_CONTEXT_ID as any);
+    const remaining = (this.pendingDisconnects.get(contextId) ?? 1) - 1;
+    if (remaining > 0) {
+      this.pendingDisconnects.set(contextId, remaining);
+      return;
+    }
+    this.pendingDisconnects.delete(contextId);
+    // Other gateways can still be executing their asynchronous disconnect hooks.
+    // A finished cycle must also never remove a newer context on the same client.
+    if (request[REQUEST_CONTEXT_ID as any] === contextId) {
+      Reflect.deleteProperty(request, REQUEST_CONTEXT_ID as any);
+    }
   }
 
   private assignServerToProperties<T = any>(

@@ -61,7 +61,7 @@ const REPLY_QUEUE = 'amq.rabbitmq.reply-to';
 export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
   protected readonly logger = new Logger(ClientProxy.name);
   protected connection$: ReplaySubject<any>;
-  protected connectionPromise: Promise<void>;
+  protected connectionPromise: Promise<void> | null;
   protected client: AmqpConnectionManager | null = null;
   protected channel: ChannelWrapper | null = null;
   protected pendingEventListeners: Array<{
@@ -107,11 +107,33 @@ export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
   }
 
   public async close(): Promise<void> {
+    this.handleClose();
     this.channel && (await this.channel.close());
     this.client && (await this.client.close());
     this.channel = null;
     this.client = null;
+    this.isInitialConnect = true;
     this.pendingEventListeners = [];
+  }
+
+  public handleClose() {
+    if (this.routingMap.size > 0) {
+      const err = new Error('Connection closed');
+      const callbacks = [...this.routingMap.values()];
+      this.routingMap.clear();
+
+      for (const callback of callbacks) {
+        try {
+          callback({ err });
+        } catch (callbackErr) {
+          // A failing callback must not keep the remaining requests pending
+          // nor prevent the connection from being closed.
+          this.logger.error(callbackErr);
+        }
+      }
+    }
+    // The listeners expect a message to parse, so they cannot carry the error.
+    this.responseEmitter?.removeAllListeners();
   }
 
   public async connect(): Promise<any> {
@@ -128,7 +150,6 @@ export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
     this.pendingEventListeners.forEach(({ event, callback }) =>
       this.client!.on(event, callback),
     );
-    this.pendingEventListeners = [];
 
     this.responseEmitter = new EventEmitter();
     this.responseEmitter.setMaxListeners(0);
@@ -146,16 +167,56 @@ export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
 
     this.connection$ = new ReplaySubject(1);
     source$.subscribe(this.connection$);
-    this.connectionPromise = this.convertConnectionToPromise();
+    const client = this.client;
+    const connectionPromise = this.convertConnectionToPromise().catch(
+      async err => {
+        // A rejected attempt must not be cached: the next `connect()` call
+        // has to try again once the broker is reachable, instead of failing
+        // forever with the error of the first attempt.
+        await this.discardPartialConnection(client);
+        throw err;
+      },
+    );
+    this.connectionPromise = connectionPromise;
 
-    return this.connectionPromise;
+    return connectionPromise;
+  }
+
+  /**
+   * Tears down whatever a failed connection attempt managed to create, so the
+   * connection manager it spawned does not keep retrying in the background
+   * while the next attempt creates a new one. The client's state is only reset
+   * if no newer attempt has replaced it in the meantime (e.g., `close()`
+   * followed by `connect()` while the failed attempt was still pending).
+   */
+  private async discardPartialConnection(
+    client: AmqpConnectionManager,
+  ): Promise<void> {
+    let channel: ChannelWrapper | null = null;
+    // Compared by client, not by promise: the disconnect listener replaces
+    // "connectionPromise" when the broker drops the connection during the setup.
+    if (this.client === client) {
+      channel = this.channel;
+      this.client = null;
+      this.channel = null;
+      this.connectionPromise = null;
+      this.isInitialConnect = true;
+    }
+    await Promise.allSettled([client.close(), channel?.close()]);
   }
 
   public createChannel(): Promise<void> {
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
       this.channel = this.client!.createChannel({
         json: false,
         setup: (channel: Channel) => this.setupChannel(channel, resolve),
+      });
+      // The wrapper emits "error" when the setup throws, and an emitter with
+      // no listener throws, which crashes the process. Rejecting is a no-op
+      // once the channel is set up, so later errors are only logged.
+      this.channel.on(RmqEventsMap.ERROR, (err: unknown) => {
+        this.logger.error(err);
+        reject(err);
       });
     });
   }
@@ -293,10 +354,6 @@ export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
 
       if (this.isInitialConnect) {
         this.isInitialConnect = false;
-
-        if (!this.channel) {
-          this.connectionPromise = this.createChannel();
-        }
       } else {
         this.connectionPromise = Promise.resolve();
       }
@@ -324,10 +381,11 @@ export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
     EventKey extends keyof RmqEvents = keyof RmqEvents,
     EventCallback extends RmqEvents[EventKey] = RmqEvents[EventKey],
   >(event: EventKey, callback: EventCallback) {
+    // Kept until `close()`, so the clients created later (e.g., after a
+    // failed connect) get it as well
+    this.pendingEventListeners.push({ event, callback });
     if (this.client) {
       this.client.addListener(event, callback);
-    } else {
-      this.pendingEventListeners.push({ event, callback });
     }
   }
 
@@ -352,9 +410,7 @@ export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
   public async handleMessage(
     packet: unknown,
     options:
-      | Record<string, unknown>
-      | ((packet: WritePacket) => any)
-      | undefined,
+      Record<string, unknown> | ((packet: WritePacket) => any) | undefined,
     callback?: (packet: WritePacket) => any,
   ): Promise<void> {
     if (isFunction(options)) {
@@ -383,6 +439,7 @@ export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
     message: ReadPacket,
     callback: (packet: WritePacket) => any,
   ): () => void {
+    let cleanup = () => {};
     try {
       const correlationId = randomStringGenerator();
       const listener = ({
@@ -406,6 +463,11 @@ export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
       delete serializedPacket.options;
 
       this.responseEmitter.on(correlationId, listener);
+      this.routingMap.set(correlationId, callback);
+      cleanup = () => {
+        this.routingMap.delete(correlationId);
+        this.responseEmitter.removeListener(correlationId, listener);
+      };
 
       const content = Buffer.from(JSON.stringify(serializedPacket));
       const sendOptions = {
@@ -444,8 +506,9 @@ export class ClientRMQ extends ClientProxy<RmqEvents, RmqStatus> {
           callback({ err }),
         );
       }
-      return () => this.responseEmitter.removeListener(correlationId, listener);
+      return cleanup;
     } catch (err) {
+      cleanup();
       callback({ err });
       return () => {};
     }

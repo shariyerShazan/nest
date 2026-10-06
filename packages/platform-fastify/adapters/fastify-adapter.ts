@@ -5,6 +5,7 @@ import {
   HttpException,
   HttpStatus,
   Logger,
+  type NestApplicationOptions,
   type RawBodyRequest,
   type RequestMethod,
   StreamableFile,
@@ -35,26 +36,32 @@ import {
   RouteShorthandOptions,
   fastify,
 } from 'fastify';
-import * as Reply from 'fastify/lib/reply.js';
+import Reply from 'fastify/lib/reply.js';
 import fastifySymbols from 'fastify/lib/symbols.js';
 import * as http from 'http';
 import * as http2 from 'http2';
 import * as https from 'https';
+import * as net from 'net';
 import {
   InjectOptions,
   Chain as LightMyRequestChain,
   Response as LightMyRequestResponse,
 } from 'light-my-request';
 import { pathToRegexp } from 'path-to-regexp';
+import { Duplex } from 'stream';
+import middie from '@fastify/middie';
 import {
+  type SecurityRequestHook,
   type VersionValue,
   loadPackage,
+  tryLoadPackage,
   isNil,
   isString,
   isUndefined,
 } from '@nestjs/common/internal';
 import { AbstractHttpAdapter } from '@nestjs/core';
 import { LegacyRouteConverter } from '@nestjs/core/internal';
+import { getMediaTypeVersion } from './utils/get-media-type-version.util.js';
 const { kRouteContext } = fastifySymbols;
 // Fastify uses `fast-querystring` internally to quickly parse URL query strings.
 import { parse as querystringParse } from 'fast-querystring';
@@ -65,18 +72,53 @@ import {
   FASTIFY_ROUTE_SCHEMA_METADATA,
 } from '../constants.js';
 import {
+  FastifyMultipartOptions,
   FastifyStaticOptions,
   FastifyViewOptions,
 } from '../interfaces/external/index.js';
 import { NestFastifyBodyParserOptions } from '../interfaces/index.js';
-import middie from './middie/fastify-middie.js';
 const { safeDecodeURI } = urlSanitizer;
+
+const MISSING_MULTIPART_PACKAGE_MESSAGE =
+  'The "@fastify/multipart" package is missing. Please, make sure to install it (npm i @fastify/multipart) ' +
+  'to use the file upload interceptors from "@nestjs/platform-fastify/multipart".';
+
+function isFastifyMultipartPlugin(plugin: unknown): boolean {
+  const fn = (plugin as { default?: unknown })?.default ?? plugin;
+  return (
+    typeof fn === 'function' &&
+    ((fn as any)[Symbol.for('plugin-meta')]?.name === '@fastify/multipart' ||
+      fn.name === 'fastifyMultipart')
+  );
+}
+
+// Covers "application/json" and the "+json" structured syntax suffix (RFC 6839),
+// e.g. "application/problem+json", with or without parameters.
+function isJsonContentType(contentType: string): boolean {
+  const mediaType = contentType.split(';')[0].trim().toLowerCase();
+  return (
+    mediaType.startsWith('application/json') || mediaType.endsWith('+json')
+  );
+}
 
 type FastifyAdapterBaseOptions<
   Server extends RawServerBase = RawServerDefault,
   Logger extends FastifyBaseLogger = FastifyBaseLogger,
 > = FastifyServerOptions<Server, Logger> & {
   skipMiddie?: boolean;
+  /**
+   * Controls the "@fastify/multipart" plugin (an optional peer dependency),
+   * which the upload interceptors from "@nestjs/platform-fastify/multipart"
+   * require.
+   *
+   * - unset (default): the adapter registers the plugin when an upload
+   *   interceptor is used, unless it is already registered.
+   * - an object: plugin options (e.g. `limits`); the plugin is registered
+   *   when the application initializes.
+   * - `true`: the same, with the plugin defaults.
+   * - `false`: the adapter never registers the plugin.
+   */
+  multipart?: boolean | FastifyMultipartOptions;
 };
 
 type FastifyHttp2SecureOptions<
@@ -153,7 +195,12 @@ export class FastifyAdapter<
   declare protected readonly instance: TInstance;
   protected _pathPrefix?: string;
 
+  private readonly openConnections = new Set<Duplex>();
+  private isClosing = false;
   private _isParserRegistered: boolean;
+  // Fastify's `hasContentTypeParser('application/json')` is always true (built-in
+  // parser), so the types registered through `useBodyParser()` are tracked here.
+  private readonly registeredContentTypes = new Set<string | RegExp>();
   private onRequestHook?: (
     request: TRequest,
     reply: TReply,
@@ -165,6 +212,9 @@ export class FastifyAdapter<
     done: (err?: Error) => void,
   ) => void | Promise<void>;
   private isMiddieRegistered: boolean;
+  private multipartMode: 'auto' | 'eager' | 'off' = 'auto';
+  private multipartOptions: FastifyMultipartOptions = {};
+  private isMultipartRequested = false;
   private pendingMiddlewares: Array<{ args: any[] }> = [];
   private versioningOptions?: VersioningOptions;
   private readonly versionConstraint = {
@@ -208,17 +258,18 @@ export class FastifyAdapter<
       // Media Type (Accept Header) Versioning Handler
       if (this.versioningOptions?.type === VersioningType.MEDIA_TYPE) {
         const MEDIA_TYPE_HEADER = 'Accept';
-        const acceptHeaderValue: string | undefined = (req.headers?.[
-          MEDIA_TYPE_HEADER
-        ] || req.headers?.[MEDIA_TYPE_HEADER.toLowerCase()]) as string;
+        const acceptHeaderValue: string | string[] | undefined =
+          req.headers?.[MEDIA_TYPE_HEADER] ||
+          req.headers?.[MEDIA_TYPE_HEADER.toLowerCase()];
 
-        const acceptHeaderVersionParameter = acceptHeaderValue
-          ? acceptHeaderValue.split(';')[1]
-          : '';
+        const headerVersion = getMediaTypeVersion(
+          acceptHeaderValue,
+          this.versioningOptions.key,
+        );
 
-        return isUndefined(acceptHeaderVersionParameter)
+        return isUndefined(headerVersion)
           ? VERSION_NEUTRAL // No version was supplied
-          : acceptHeaderVersionParameter.split(this.versioningOptions.key)[1];
+          : headerVersion;
       }
       // Header Versioning Handler
       else if (this.versioningOptions?.type === VersioningType.HEADER) {
@@ -260,6 +311,9 @@ export class FastifyAdapter<
         : fastify({
             ...(instanceOrOptions as FastifyServerOptions),
             routerOptions: {
+              ...this.getTopLevelRouterOptions(
+                instanceOrOptions as FastifyServerOptions,
+              ),
               ...(instanceOrOptions as FastifyServerOptions)?.routerOptions,
               constraints: {
                 version: this.versionConstraint as any,
@@ -271,6 +325,14 @@ export class FastifyAdapter<
 
     if ((instanceOrOptions as FastifyAdapterBaseOptions)?.skipMiddie) {
       this.isMiddieRegistered = true;
+    }
+    const multipart = (instanceOrOptions as FastifyAdapterBaseOptions)
+      ?.multipart;
+    if (multipart === false) {
+      this.multipartMode = 'off';
+    } else if (multipart) {
+      this.multipartMode = 'eager';
+      this.multipartOptions = multipart === true ? {} : { ...multipart };
     }
 
     this.instance.addHook('onRequest', (request, reply, done) => {
@@ -311,6 +373,9 @@ export class FastifyAdapter<
   }
 
   public async init() {
+    if (this.multipartMode === 'eager') {
+      this.useMultipart();
+    }
     if (this.isMiddieRegistered) {
       return;
     }
@@ -481,9 +546,10 @@ export class FastifyAdapter<
       }
       body = body.getStream();
     }
+    const responseContentType = fastifyReply.getHeader('Content-Type');
     if (
-      fastifyReply.getHeader('Content-Type') !== undefined &&
-      fastifyReply.getHeader('Content-Type') !== 'application/json' &&
+      typeof responseContentType === 'string' &&
+      !isJsonContentType(responseContentType) &&
       body?.statusCode >= HttpStatus.BAD_REQUEST
     ) {
       Logger.warn(
@@ -503,8 +569,13 @@ export class FastifyAdapter<
     return (response as { code: Function }).code(statusCode);
   }
 
-  public end(response: TReply, message?: string) {
-    response.raw.end(message!);
+  public end(response: TRawResponse | TReply, message?: string) {
+    if (this.isNativeResponse(response)) {
+      response.end(message!);
+      return;
+    }
+    const reply: TReply = response;
+    reply.raw.end(message!);
   }
 
   public render(
@@ -541,7 +612,62 @@ export class FastifyAdapter<
       FastifyRegister<FastifyInstance<TServer, TRawRequest, TRawResponse>>
     >,
   >(plugin: TRegister['0'], opts?: TRegister['1']) {
+    if (
+      this.multipartMode !== 'off' &&
+      isFastifyMultipartPlugin(plugin) &&
+      !this.instance.hasRequestDecorator('isMultipart')
+    ) {
+      // The adapter owns the "@fastify/multipart" registration, so that the
+      // plugin is registered once whether or not the user registers it too.
+      // The user's options apply over the adapter's.
+      this.multipartOptions = { ...this.multipartOptions, ...opts };
+      this.useMultipart();
+      return this.instance;
+    }
     return (this.instance.register as any)(plugin, opts);
+  }
+
+  /**
+   * Registers the "@fastify/multipart" plugin, unless the adapter's
+   * `multipart` option is `false`, or the plugin has been registered
+   * already by the time it loads. Idempotent. Called by the upload
+   * interceptors from "@nestjs/platform-fastify/multipart".
+   *
+   * The plugin is loaded lazily, and a missing package fails the
+   * application's startup (`ready()`) with an error naming the package,
+   * rather than exiting the process.
+   */
+  public useMultipart() {
+    if (this.multipartMode === 'off' || this.isMultipartRequested) {
+      return;
+    }
+    this.isMultipartRequested = true;
+    const registerMultipart = async (instance: FastifyInstance) => {
+      // Plugins load in registration order, so one the user registered
+      // before this point has loaded by now.
+      if (instance.hasRequestDecorator('isMultipart')) {
+        return;
+      }
+      const multipart = await tryLoadPackage(
+        '@fastify/multipart',
+        () => import('@fastify/multipart'),
+      );
+      if (!multipart) {
+        throw new Error(MISSING_MULTIPART_PACKAGE_MESSAGE);
+      }
+      // Copied: the plugin writes its defaults into the options it receives.
+      const { limits, ...options } = this.multipartOptions;
+      await instance.register(multipart, {
+        ...options,
+        ...(limits && { limits: { ...limits } }),
+      });
+    };
+    // Like `fastify-plugin`: register on the root context, not a child one.
+    Object.assign(registerMultipart, {
+      [Symbol.for('skip-override')]: true,
+      [Symbol.for('fastify.display-name')]: 'nestjs-multipart',
+    });
+    this.instance.register(registerMultipart as any);
   }
 
   public inject(): LightMyRequestChain;
@@ -553,24 +679,33 @@ export class FastifyAdapter<
   }
 
   public async close() {
+    this.isClosing = true;
     try {
-      return await this.instance.close();
-    } catch (err) {
-      // Check if server is still running
-      if (err.code !== 'ERR_SERVER_NOT_RUNNING') {
-        throw err;
-      }
-      return;
+      this.closeOpenConnections();
+    } finally {
+      await this.instance.close().catch(err => {
+        // Check if server is still running
+        if (err.code !== 'ERR_SERVER_NOT_RUNNING') {
+          throw err;
+        }
+      });
     }
   }
 
-  public initHttpServer() {
+  public initHttpServer(options: NestApplicationOptions = {}) {
     this.httpServer = this.instance.server;
+    if (options?.forceCloseConnections) {
+      this.trackOpenConnections();
+    }
   }
 
-  public async useStaticAssets(options: FastifyStaticOptions) {
+  // `register()` accepts a promise of a plugin, so the import is handed over
+  // unawaited on purpose. `NestApplication.useStaticAssets()` discards what
+  // this returns, so awaiting here would enqueue the plugin after the caller
+  // has already moved on to `listen()`.
+  public useStaticAssets(options: FastifyStaticOptions) {
     return this.register(
-      await loadPackage(
+      loadPackage(
         '@fastify/static',
         'FastifyAdapter.useStaticAssets()',
         () => import('@fastify/static'),
@@ -579,7 +714,8 @@ export class FastifyAdapter<
     );
   }
 
-  public async setViewEngine(options: FastifyViewOptions | string) {
+  // Handed over unawaited for the same reason as `useStaticAssets()` above.
+  public setViewEngine(options: FastifyViewOptions | string) {
     if (isString(options)) {
       new Logger('FastifyAdapter').error(
         "setViewEngine() doesn't support a string argument.",
@@ -587,7 +723,7 @@ export class FastifyAdapter<
       process.exit(1);
     }
     return this.register(
-      await loadPackage(
+      loadPackage(
         '@fastify/view',
         'FastifyAdapter.setViewEngine()',
         () => import('@fastify/view'),
@@ -596,8 +732,14 @@ export class FastifyAdapter<
     );
   }
 
-  public isHeadersSent(response: TReply): boolean {
-    return response.sent;
+  public isHeadersSent(response: TRawResponse | TReply): boolean {
+    if (this.isNativeResponse(response)) {
+      return response.headersSent;
+    }
+    const reply: TReply = response;
+    // `reply.sent` only covers hijacked or ended replies, not headers
+    // already flushed through `reply.raw`.
+    return reply.sent || reply.raw.headersSent;
   }
 
   public getHeader(response: any, name: string) {
@@ -645,6 +787,23 @@ export class FastifyAdapter<
     );
   }
 
+  /**
+   * Runs the request hook of the built-in HTTP security features in an
+   * `onRequest` hook: before middie (Nest middleware), content-type parsing,
+   * guards and handlers, and also for unmatched routes. Headers set by the
+   * hook go to the Node.js response (`reply.raw`): Fastify merges them into
+   * every response it sends, errors and `404`s included, while
+   * `reply.header()` / `@Header()` values take precedence, and responses
+   * written to `reply.raw` directly (e.g. `@Sse()`) carry them too. A
+   * rejection goes to `done(error)`, i.e. to the Nest exception layer
+   * installed with `setErrorHandler()`.
+   */
+  public registerSecurityHook(hook: SecurityRequestHook<TRequest>) {
+    this.instance.addHook('onRequest', (request, reply, done) => {
+      done(hook(request as TRequest, reply.raw) as FastifyError | undefined);
+    });
+  }
+
   public registerParserMiddleware(prefix?: string, rawBody?: boolean) {
     if (this._isParserRegistered) {
       return;
@@ -667,10 +826,18 @@ export class FastifyAdapter<
     options?: NestFastifyBodyParserOptions,
     parser?: FastifyBodyParser<Buffer, TServer>,
   ) {
+    if (Array.isArray(type)) {
+      // One by one, so that each content type gets its own default parser.
+      for (const contentType of type) {
+        this.useBodyParser(contentType, rawBody, options, parser);
+      }
+      return;
+    }
     const parserOptions = {
       ...(options || {}),
       parseAs: 'buffer' as const,
     };
+    const bodyParser = parser ?? this.getDefaultBodyParser(type);
 
     this.getInstance().addContentTypeParser<Buffer>(
       type,
@@ -684,8 +851,8 @@ export class FastifyAdapter<
           req.rawBody = body;
         }
 
-        if (parser) {
-          parser(req, body, done);
+        if (bodyParser) {
+          bodyParser(req, body, done);
           return;
         }
 
@@ -693,9 +860,7 @@ export class FastifyAdapter<
       },
     );
 
-    // To avoid the Nest application init to override our custom
-    // body parser, we mark the parsers as registered.
-    this._isParserRegistered = true;
+    this.registeredContentTypes.add(this.normalizeContentType(type));
   }
 
   public async createMiddlewareFactory(
@@ -820,38 +985,68 @@ export class FastifyAdapter<
 
   private registerJsonContentParser(rawBody?: boolean) {
     const contentType = 'application/json';
+    if (this.hasCustomBodyParser(contentType)) {
+      return;
+    }
     const withRawBody = !!rawBody;
     const { bodyLimit } = this.getInstance().initialConfig;
 
-    this.useBodyParser(
-      contentType,
-      withRawBody,
-      { bodyLimit },
-      (req, body, done) => {
-        const { onProtoPoisoning, onConstructorPoisoning } =
-          this.instance.initialConfig;
-        const defaultJsonParser = this.instance.getDefaultJsonParser(
-          onProtoPoisoning || 'error',
-          onConstructorPoisoning || 'error',
-        ) as FastifyBodyParser<string | Buffer, TServer>;
-        defaultJsonParser(req, body, done);
-      },
-    );
+    this.useBodyParser(contentType, withRawBody, { bodyLimit });
   }
 
   private registerUrlencodedContentParser(rawBody?: boolean) {
     const contentType = 'application/x-www-form-urlencoded';
+    if (this.hasCustomBodyParser(contentType)) {
+      return;
+    }
     const withRawBody = !!rawBody;
     const { bodyLimit } = this.getInstance().initialConfig;
 
-    this.useBodyParser(
-      contentType,
-      withRawBody,
-      { bodyLimit },
-      (_req, body, done) => {
-        done(null, querystringParse(body.toString()));
-      },
-    );
+    this.useBodyParser(contentType, withRawBody, { bodyLimit });
+  }
+
+  // A parser registered through `useBodyParser()` takes precedence over the
+  // default one, including a RegExp or catch-all ('*') parser matching the type.
+  private hasCustomBodyParser(contentType: string) {
+    for (const type of this.registeredContentTypes) {
+      if (type === '*' || type === contentType) {
+        return true;
+      }
+      if (isString(type)) {
+        continue;
+      }
+      type.lastIndex = 0;
+      if (type.test(contentType)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Fastify stores string content types trimmed and lower-cased.
+  private normalizeContentType(type: string | RegExp) {
+    return isString(type) ? type.trim().toLowerCase() : type;
+  }
+
+  private getDefaultBodyParser(
+    type: string | RegExp,
+  ): FastifyBodyParser<Buffer, TServer> | undefined {
+    switch (this.normalizeContentType(type)) {
+      case 'application/json':
+        return (req, body, done) => {
+          const { onProtoPoisoning, onConstructorPoisoning } =
+            this.instance.initialConfig;
+          const defaultJsonParser = this.instance.getDefaultJsonParser(
+            onProtoPoisoning || 'error',
+            onConstructorPoisoning || 'error',
+          ) as FastifyBodyParser<string | Buffer, TServer>;
+          defaultJsonParser(req, body, done);
+        };
+      case 'application/x-www-form-urlencoded':
+        return (_req, body, done) => {
+          done(null, querystringParse(body.toString()));
+        };
+    }
   }
 
   private async registerMiddie() {
@@ -932,10 +1127,44 @@ export class FastifyAdapter<
     return this.instance.route(routeToInject);
   }
 
+  /**
+   * Fastify still accepts the router options ("ignoreTrailingSlash",
+   * "caseSensitive", ...) at the top level, but "initialConfig.routerOptions"
+   * only reflects them when they are passed through "routerOptions". As the
+   * adapter always passes "routerOptions" (for the version constraint), the
+   * top-level values are folded in so that plugins relying on
+   * "initialConfig.routerOptions" (like @fastify/middie) normalize request
+   * paths exactly like the router does.
+   */
+  private getTopLevelRouterOptions(
+    options?: FastifyServerOptions,
+  ): NonNullable<FastifyServerOptions['routerOptions']> {
+    const routerOptions: Record<string, unknown> = {};
+    const routerOptionKeys = [
+      'ignoreTrailingSlash',
+      'ignoreDuplicateSlashes',
+      'caseSensitive',
+      'useSemicolonDelimiter',
+      'maxParamLength',
+      'allowUnsafeRegex',
+    ] as const;
+    for (const key of routerOptionKeys) {
+      if (options?.[key] !== undefined) {
+        routerOptions[key] = options[key];
+      }
+    }
+    return routerOptions;
+  }
+
   private sanitizeUrl(url: string): string {
     const initialConfig = this.instance.initialConfig as FastifyServerOptions;
     const routerOptions =
       initialConfig.routerOptions as Partial<FastifyServerOptions>;
+
+    // Absolute-form request targets ("GET http://host/path HTTP/1.1") must be
+    // resolved to their path before any other normalization, as the Fastify
+    // router does, so that middleware and routes always match the same path.
+    url = this.getPathFromRequestTarget(url);
 
     if (
       routerOptions.ignoreDuplicateSlashes ||
@@ -976,5 +1205,65 @@ export class FastifyAdapter<
       return path.slice(0, -1);
     }
     return path;
+  }
+
+  /**
+   * Mirrors the absolute-form request target handling of "find-my-way".
+   * Returns the path of an absolute-form target ("http://host/path" -> "/path")
+   * and leaves any other request target untouched.
+   */
+  private getPathFromRequestTarget(url: string): string {
+    if (url.charCodeAt(0) === 47 /* '/' */) {
+      return url;
+    }
+    const schemeEnd = url.indexOf('://');
+    if (schemeEnd === -1) {
+      return url;
+    }
+    const scheme = url.slice(0, schemeEnd).toLowerCase();
+    if (scheme !== 'http' && scheme !== 'https') {
+      return url;
+    }
+    const authorityStart = schemeEnd + 3;
+    const pathStart = url.indexOf('/', authorityStart);
+    if (pathStart === authorityStart || !URL.canParse(url)) {
+      // Malformed target: the router rejects it before any middleware runs
+      return url;
+    }
+    return pathStart === -1 ? '/' : url.slice(pathStart);
+  }
+
+  private trackOpenConnections() {
+    const track = (socket: Duplex) => {
+      if (this.isClosing) {
+        // Fastify runs its `preClose` hooks before it stops accepting
+        // connections, so destroy anything that arrives in the meantime
+        socket.destroy();
+        return;
+      }
+      if (this.openConnections.has(socket)) {
+        return;
+      }
+      this.openConnections.add(socket);
+      socket.on('close', () => this.openConnections.delete(socket));
+    };
+    this.httpServer.on('connection', track);
+    // Sockets accepted by the secondary servers Fastify binds for every
+    // address `listen()` resolves to are only reachable through requests.
+    // `inject()` requests carry a mock socket, which must not be tracked.
+    this.instance.addHook('onRequest', (request, _reply, done) => {
+      const socket = request.raw.socket;
+      if (socket instanceof net.Socket) {
+        track(socket);
+      }
+      done();
+    });
+  }
+
+  private closeOpenConnections() {
+    for (const socket of this.openConnections) {
+      socket.destroy();
+      this.openConnections.delete(socket);
+    }
   }
 }

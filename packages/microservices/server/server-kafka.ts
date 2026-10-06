@@ -1,4 +1,10 @@
-import { isObservable, lastValueFrom, Observable, ReplaySubject } from 'rxjs';
+import {
+  finalize,
+  isObservable,
+  lastValueFrom,
+  Observable,
+  ReplaySubject,
+} from 'rxjs';
 import {
   KAFKA_DEFAULT_BROKER,
   KAFKA_DEFAULT_CLIENT,
@@ -40,6 +46,9 @@ import { isNil } from '@nestjs/common/internal';
  * @publicApi
  */
 export class ServerKafka extends Server<never, KafkaStatus> {
+  // `handleEvent` awaits the stream, so the rejection reaches kafkajs, which
+  // logs it. A second report here would duplicate it.
+  public override readonly propagatesEventHandlerErrors = true;
   public transportId: TransportId = Transport.KAFKA;
 
   protected logger = new Logger(ServerKafka.name);
@@ -301,8 +310,7 @@ export class ServerKafka extends Server<never, KafkaStatus> {
         err: NO_MESSAGE_HANDLER,
       });
     }
-    return this.onProcessingStartHook(
-      this.transportId,
+    return this.handleRequest(
       kafkaContext,
       async () => {
         const response$ = this.transformToObservable(
@@ -311,9 +319,9 @@ export class ServerKafka extends Server<never, KafkaStatus> {
 
         const replayStream$ = new ReplaySubject();
         await this.combineStreamsAndThrowIfRetriable(response$, replayStream$);
-
-        this.send(replayStream$, publish);
+        return replayStream$;
       },
+      publish,
     );
   }
 
@@ -356,7 +364,15 @@ export class ServerKafka extends Server<never, KafkaStatus> {
           }
           replayStream$.error(err);
         },
-        complete: () => replayStream$.complete(),
+        complete: () => {
+          replayStream$.complete();
+          // A stream that completes without emitting must still settle the
+          // promise, or the handler never publishes and the span never closes.
+          if (!isPromiseResolved) {
+            isPromiseResolved = true;
+            resolve();
+          }
+        },
       });
     });
   }
@@ -379,9 +395,7 @@ export class ServerKafka extends Server<never, KafkaStatus> {
       messages: [outgoingMessage],
       ...(this.options.send || {}),
     };
-    return this.producer!.send(replyMessage).finally(() => {
-      this.onProcessingEndHook?.(this.transportId, context);
-    });
+    return this.producer!.send(replyMessage);
   }
 
   public assignIsDisposedHeader(
@@ -437,11 +451,14 @@ export class ServerKafka extends Server<never, KafkaStatus> {
       return this.logger.error(NO_EVENT_HANDLER`${pattern}`);
     }
 
-    return this.onProcessingStartHook(this.transportId, context, async () => {
+    return this.runWithProcessingHooks(context, async runEndHook => {
       const resultOrStream = await handler(packet.data, context);
       if (isObservable(resultOrStream)) {
-        await lastValueFrom(resultOrStream);
-        this.onProcessingEndHook?.(this.transportId, context);
+        await lastValueFrom(resultOrStream.pipe(finalize(runEndHook)), {
+          defaultValue: undefined,
+        });
+      } else {
+        runEndHook();
       }
     });
   }

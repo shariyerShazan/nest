@@ -1,6 +1,8 @@
+import { Scope } from '@nestjs/common';
 import { REQUEST } from '@nestjs/core';
 import { Injector } from '@nestjs/core/injector/injector.js';
 import { Module } from '@nestjs/core/injector/module.js';
+import { InstanceWrapper } from '@nestjs/core/injector/instance-wrapper.js';
 import { REQUEST_CONTEXT_ID } from '@nestjs/core/router/request/request-constants.js';
 import { NestContainer } from '@nestjs/core';
 import { ApplicationConfig } from '@nestjs/core/application-config.js';
@@ -366,6 +368,103 @@ describe('WebSocketsController', () => {
     });
   });
   describe('createRequestScopedHandler', () => {
+    it('should load global enhancers for a singleton without resolving the gateway per context', async () => {
+      class Gateway {
+        onMessage() {}
+      }
+      const gateway = new Gateway();
+      const wrapper = new InstanceWrapper({
+        token: Gateway,
+        metatype: Gateway,
+        instance: gateway,
+        isResolved: true,
+      });
+      const moduleRef = {
+        providers: new Map([[Gateway, wrapper]]),
+      } as Module;
+      const guard = new InstanceWrapper();
+      const pipe = new InstanceWrapper();
+      const interceptor = new InstanceWrapper();
+      config.addGlobalRequestGuard(guard);
+      config.addGlobalRequestPipe(pipe);
+      config.addGlobalRequestInterceptor(interceptor);
+      config.addGlobalRequestFilter(new InstanceWrapper());
+      vi.spyOn(container, 'registerRequestProvider').mockImplementation(
+        () => undefined,
+      );
+      const loadGateway = vi.spyOn(injector, 'loadPerContext');
+      const loadEnhancers = vi
+        .spyOn(injector, 'loadEnhancersPerContext')
+        .mockResolvedValue();
+      const createContext = vi.spyOn(untypedInstance.contextCreator, 'create');
+      const client = {};
+
+      await instance.createRequestScopedHandler(
+        wrapper,
+        moduleRef,
+        'moduleKey',
+        'onMessage',
+      )(client);
+
+      expect(loadGateway).not.toHaveBeenCalled();
+      expect(loadEnhancers).toHaveBeenCalledWith(
+        wrapper,
+        client[REQUEST_CONTEXT_ID as any],
+        wrapper,
+        [guard, pipe, interceptor],
+      );
+      expect(createContext).toHaveBeenCalledWith(
+        gateway,
+        gateway.onMessage,
+        'moduleKey',
+        'onMessage',
+        client[REQUEST_CONTEXT_ID as any],
+        wrapper.id,
+      );
+      expect(wrapper.isDependencyTreeStatic()).toBe(true);
+      expect(wrapper.getEnhancersMetadata()).toBeUndefined();
+    });
+
+    it.each([
+      [true, true],
+      [false, false],
+      [undefined, false],
+    ])(
+      'should take the durability of the global enhancers for a singleton (durable: %s)',
+      async (durable, expected) => {
+        class Gateway {
+          onMessage() {}
+        }
+        const wrapper = new InstanceWrapper({
+          token: Gateway,
+          metatype: Gateway,
+          instance: new Gateway(),
+          isResolved: true,
+        });
+        config.addGlobalRequestGuard(
+          new InstanceWrapper({ scope: Scope.REQUEST, durable }),
+        );
+        vi.spyOn(container, 'registerRequestProvider').mockImplementation(
+          () => undefined,
+        );
+        vi.spyOn(injector, 'loadEnhancersPerContext').mockResolvedValue();
+        vi.spyOn(untypedInstance.contextCreator, 'create').mockReturnValue(
+          () => undefined,
+        );
+        const getContextId = vi.spyOn(instance, 'getContextId');
+        const client = {};
+
+        await instance.createRequestScopedHandler(
+          wrapper,
+          { providers: new Map([[Gateway, wrapper]]) } as Module,
+          'moduleKey',
+          'onMessage',
+        )(client);
+
+        expect(getContextId).toHaveBeenCalledWith(client, expected);
+      },
+    );
+
     it('should reuse the same context id for the same client', async () => {
       const client = {};
       const moduleRef = {
@@ -374,6 +473,7 @@ describe('WebSocketsController', () => {
       const instanceWrapper = {
         id: 'wrapper-id',
         instance: { onMessage() {} },
+        isDependencyTreeStatic: () => false,
         isDependencyTreeDurable: () => false,
       } as any;
       const perContextMethod = vi.fn();
@@ -417,11 +517,125 @@ describe('WebSocketsController', () => {
     });
   });
   describe('createRequestScopedEventHandler', () => {
+    it('should release a singleton connection context even without a disconnect hook', async () => {
+      class Gateway {}
+      const wrapper = new InstanceWrapper({
+        token: Gateway,
+        metatype: Gateway,
+        instance: new Gateway(),
+        isResolved: true,
+      });
+      const moduleRef = {
+        providers: new Map([[Gateway, wrapper]]),
+      } as Module;
+      const client = {};
+      vi.spyOn(container, 'registerRequestProvider').mockImplementation(
+        () => undefined,
+      );
+      const loadGateway = vi.spyOn(injector, 'loadPerContext');
+      instance.getContextId(client, false);
+      expect(client[REQUEST_CONTEXT_ID as any]).toBeDefined();
+
+      await instance.createRequestScopedEventHandler(
+        wrapper,
+        moduleRef,
+        'moduleKey',
+        'handleDisconnect',
+        {},
+      )(client);
+
+      expect(loadGateway).not.toHaveBeenCalled();
+      expect(client[REQUEST_CONTEXT_ID as any]).toBeUndefined();
+    });
+
+    it('should retain a shared context until all disconnect hooks finish', async () => {
+      let release: () => void;
+      const pending = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      const fast = { handleDisconnect: vi.fn() };
+      let contextDuringSlowHook: unknown;
+      const client = {};
+      const slow = {
+        handleDisconnect: async () => {
+          await pending;
+          contextDuringSlowHook = client[REQUEST_CONTEXT_ID as any];
+        },
+      };
+      vi.spyOn(container, 'registerRequestProvider').mockImplementation(
+        () => undefined,
+      );
+      vi.spyOn(injector, 'loadPerContext').mockImplementation(
+        async (target: any) => target,
+      );
+      const wrapper = (gateway: any) =>
+        ({
+          instance: gateway,
+          isDependencyTreeStatic: () => false,
+          isDependencyTreeDurable: () => false,
+        }) as any;
+      const moduleRef = { providers: new Map() } as Module;
+      const slowHandler = instance.createRequestScopedEventHandler(
+        wrapper(slow),
+        moduleRef,
+        'moduleKey',
+        'handleDisconnect',
+        {},
+      );
+      const fastHandler = instance.createRequestScopedEventHandler(
+        wrapper(fast),
+        moduleRef,
+        'moduleKey',
+        'handleDisconnect',
+        {},
+      );
+      const slowResult = slowHandler(client);
+      const contextId = client[REQUEST_CONTEXT_ID as any];
+      await fastHandler(client);
+      expect(client[REQUEST_CONTEXT_ID as any]).toBe(contextId);
+      release!();
+      await slowResult;
+      expect(contextDuringSlowHook).toBe(contextId);
+      expect(client[REQUEST_CONTEXT_ID as any]).toBeUndefined();
+    });
+
+    it('should preserve a newer context when an old disconnect hook completes', async () => {
+      let release: () => void;
+      const pending = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      const gateway = { handleDisconnect: async () => pending };
+      vi.spyOn(container, 'registerRequestProvider').mockImplementation(
+        () => undefined,
+      );
+      vi.spyOn(injector, 'loadPerContext').mockResolvedValue(gateway as never);
+      const wrapper = {
+        instance: gateway,
+        isDependencyTreeStatic: () => false,
+        isDependencyTreeDurable: () => false,
+      } as any;
+      const handler = instance.createRequestScopedEventHandler(
+        wrapper,
+        { providers: new Map() } as Module,
+        'moduleKey',
+        'handleDisconnect',
+        {},
+      );
+      const client = {};
+      const result = handler(client);
+      Reflect.deleteProperty(client, REQUEST_CONTEXT_ID);
+      const newContext = instance.getContextId(client, false);
+      release!();
+      await result;
+      expect(client[REQUEST_CONTEXT_ID as any]).toBe(newContext);
+    });
+
     it('should cleanup request-scoped context on disconnect', async () => {
       const client = {};
       const gatewayWrapper = {
         id: 'gateway-wrapper',
         token: Symbol('gateway-wrapper'),
+        isDependencyTreeStatic: () => false,
         instance: {
           handleDisconnect() {},
         },
@@ -458,6 +672,87 @@ describe('WebSocketsController', () => {
       );
       expect(contextId).toBeDefined();
       expect(client[REQUEST_CONTEXT_ID as any]).toBeUndefined();
+    });
+
+    it('should cleanup request-scoped context after async handleDisconnect completes', async () => {
+      const client = {};
+      const gatewayWrapper = {
+        id: 'gateway-wrapper',
+        isDependencyTreeStatic: () => false,
+        instance: {
+          handleDisconnect() {},
+        },
+        isDependencyTreeDurable: () => false,
+      } as any;
+      const moduleRef = {
+        providers: new Map(),
+      } as Module;
+      let contextIdDuringHook: unknown;
+
+      vi.spyOn(container, 'registerRequestProvider').mockImplementation(
+        () => undefined,
+      );
+      vi.spyOn(injector, 'loadPerContext').mockResolvedValue({
+        handleDisconnect: async () => {
+          await Promise.resolve();
+          contextIdDuringHook = client[REQUEST_CONTEXT_ID as any];
+        },
+      } as never);
+
+      const handler = instance.createRequestScopedEventHandler(
+        gatewayWrapper,
+        moduleRef,
+        'moduleKey',
+        'handleDisconnect',
+        {},
+      );
+
+      await handler(client);
+
+      expect(contextIdDuringHook).toBeDefined();
+      expect(client[REQUEST_CONTEXT_ID as any]).toBeUndefined();
+    });
+
+    it('should pass async hook errors to the exception filter', async () => {
+      const client = {};
+      const error = new Error('Unauthorized');
+      const gatewayWrapper = {
+        id: 'gateway-wrapper',
+        isDependencyTreeStatic: () => false,
+        instance: {
+          handleConnection() {},
+        },
+        isDependencyTreeDurable: () => false,
+      } as any;
+      const moduleRef = {
+        providers: new Map(),
+      } as Module;
+      const exceptionFilter = { handle: vi.fn() };
+
+      vi.spyOn(container, 'registerRequestProvider').mockImplementation(
+        () => undefined,
+      );
+      vi.spyOn(injector, 'loadPerContext').mockResolvedValue({
+        handleConnection: () => Promise.reject(error),
+      } as never);
+      vi.spyOn(exceptionFiltersContext, 'create').mockReturnValue(
+        exceptionFilter as any,
+      );
+
+      const handler = instance.createRequestScopedEventHandler(
+        gatewayWrapper,
+        moduleRef,
+        'moduleKey',
+        'handleConnection',
+        {},
+      );
+
+      await handler(client);
+
+      expect(exceptionFilter.handle).toHaveBeenCalledWith(
+        error,
+        expect.anything(),
+      );
     });
   });
   describe('getConnectionHandler', () => {

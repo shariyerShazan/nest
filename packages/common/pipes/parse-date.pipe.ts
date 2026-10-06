@@ -1,4 +1,5 @@
 import { Injectable } from '../decorators/core/injectable.decorator.js';
+import { Optional } from '../decorators/core/optional.decorator.js';
 import { HttpStatus } from '../enums/http-status.enum.js';
 import { PipeTransform } from '../interfaces/features/pipe-transform.interface.js';
 import {
@@ -17,7 +18,8 @@ export interface ParseDatePipeOptions {
    */
   optional?: boolean;
   /**
-   * Default value for the date
+   * A factory whose result is returned when the value is `null` or `undefined`,
+   * regardless of `optional`
    */
   default?: () => Date;
   /**
@@ -40,7 +42,9 @@ export interface ParseDatePipeOptions {
 export class ParseDatePipe implements PipeTransform {
   protected exceptionFactory: (error: string) => any;
 
-  constructor(private readonly options: ParseDatePipeOptions = {}) {
+  constructor(
+    @Optional() protected readonly options: ParseDatePipeOptions = {},
+  ) {
     const { exceptionFactory, errorHttpStatusCode = HttpStatus.BAD_REQUEST } =
       options;
 
@@ -57,8 +61,14 @@ export class ParseDatePipe implements PipeTransform {
    * @param metadata contains metadata about the currently processed route argument
    */
   transform(value: unknown): Date | null | undefined {
-    if (this.options.optional && isNil(value)) {
-      return this.options.default ? this.options.default() : value;
+    if (isNil(value)) {
+      // `default` applies to nil values whether or not `optional` is set.
+      if (this.options.default) {
+        return this.options.default();
+      }
+      if (this.options.optional) {
+        return value;
+      }
     }
 
     if (isNil(value) || value === '') {

@@ -15,22 +15,25 @@ import type { Server } from 'http';
 import * as http from 'http';
 import * as https from 'https';
 import { pathToRegexp } from 'path-to-regexp';
-import { Duplex, Writable } from 'stream';
+import { Duplex, finished, Writable } from 'stream';
 import {
   NestExpressBodyParserOptionsFor,
   NestExpressBodyParserType,
 } from '../interfaces/nest-express-body-parser.interface.js';
 import { ServeStaticOptions } from '../interfaces/serve-static-options.interface.js';
 import { getBodyParserOptions } from './utils/get-body-parser-options.util.js';
+import { getMediaTypeVersion } from './utils/get-media-type-version.util.js';
 import {
   type CorsOptions,
   type CorsOptionsDelegate,
   type VersionValue,
+  addLeadingSlash,
   isFunction,
   isNil,
   isObject,
   isString,
   isUndefined,
+  stripEndSlash,
 } from '@nestjs/common/internal';
 import type { NestApplicationOptions } from '@nestjs/common';
 import { AbstractHttpAdapter } from '@nestjs/core';
@@ -47,6 +50,15 @@ type VersionedRoute = <
   res: TResponse,
   next: () => void,
 ) => any;
+
+// Covers "application/json" and the "+json" structured syntax suffix (RFC 6839),
+// e.g. "application/problem+json", with or without parameters.
+function isJsonContentType(contentType: string): boolean {
+  const mediaType = contentType.split(';')[0].trim().toLowerCase();
+  return (
+    mediaType.startsWith('application/json') || mediaType.endsWith('+json')
+  );
+}
 
 /**
  * @publicApi
@@ -118,6 +130,13 @@ export class ExpressAdapter extends AbstractHttpAdapter<
       stream.once('error', err => {
         body.errorHandler(err, response);
       });
+      // pipe() leaves the source open when the client disconnects early,
+      // also before reply() runs ("close" has already fired by then)
+      finished(response, () => {
+        if (!stream.readableEnded) {
+          stream.destroy();
+        }
+      });
       return stream
         .pipe<Writable>(response)
         .on('error', (err: Error) => body.errorLogger(err));
@@ -125,7 +144,7 @@ export class ExpressAdapter extends AbstractHttpAdapter<
     const responseContentType = response.getHeader('Content-Type');
     if (
       typeof responseContentType === 'string' &&
-      !responseContentType.startsWith('application/json') &&
+      !isJsonContentType(responseContentType) &&
       body?.statusCode >= HttpStatus.BAD_REQUEST
     ) {
       this.logger.warn(
@@ -153,10 +172,11 @@ export class ExpressAdapter extends AbstractHttpAdapter<
   }
 
   public setErrorHandler(handler: Function, prefix?: string) {
-    if (prefix) {
+    const normalizedPrefix = this.normalizePrefix(prefix);
+    if (normalizedPrefix) {
       const router = express.Router();
       router.use(handler as any);
-      this.use(prefix, router);
+      this.use(normalizedPrefix, router);
     }
     // Always mount the error handler at the root as well, so routes living
     // outside the global prefix (e.g. "setGlobalPrefix" exclusions or
@@ -165,11 +185,12 @@ export class ExpressAdapter extends AbstractHttpAdapter<
   }
 
   public setNotFoundHandler(handler: Function, prefix?: string) {
-    if (prefix) {
-      this.registeredPrefixes.add(prefix);
+    const normalizedPrefix = this.normalizePrefix(prefix);
+    if (normalizedPrefix) {
+      this.registeredPrefixes.add(normalizedPrefix);
       const router = express.Router();
       router.all('*path', handler as any);
-      return this.use(prefix, router);
+      return this.use(normalizedPrefix, router);
     }
     return this.use(
       (
@@ -303,10 +324,25 @@ export class ExpressAdapter extends AbstractHttpAdapter<
   ): (path: string, callback: Function) => any {
     return (path: string, callback: Function) => {
       try {
-        const convertedPath = LegacyRouteConverter.tryConvert(path);
-        return this.routerMethodFactory
-          .get(this.instance, requestMethod)
-          .call(this.instance, convertedPath, callback);
+        // The core marks an exact-match path with a trailing "$" (e.g. "/api$").
+        // Express 5 reads "$" literally and "use()" matches by prefix, so strip
+        // the marker and register the path as an exact "all()" route instead.
+        const isExactPath = path.endsWith('$');
+        const convertedPath = LegacyRouteConverter.tryConvert(
+          isExactPath ? path.slice(0, -1) : path,
+        );
+        let router = this.routerMethodFactory.get(this.instance, requestMethod);
+        if (isExactPath && router === this.instance.use) {
+          router = this.instance.all;
+        }
+        // Express routes are not strict, so "/api" also matches "/api/". That
+        // path is left to the wildcard entry registered next to it (an optional
+        // "{*path}" matches it), so the middleware doesn't run twice.
+        const handler = isExactPath
+          ? (req: any, res: any, next: Function) =>
+              req.path.endsWith('/') ? next() : callback(req, res, next)
+          : callback;
+        return router.call(this.instance, convertedPath, handler);
       } catch (e) {
         if (e instanceof TypeError) {
           LegacyRouteConverter.printError(path);
@@ -461,26 +497,23 @@ export class ExpressAdapter extends AbstractHttpAdapter<
         next,
       ) => {
         const MEDIA_TYPE_HEADER = 'Accept';
-        const acceptHeaderValue: string | undefined =
+        const acceptHeaderValue: string | string[] | undefined =
           req.headers?.[MEDIA_TYPE_HEADER] ||
           req.headers?.[MEDIA_TYPE_HEADER.toLowerCase()];
 
-        const acceptHeaderVersionParameter = acceptHeaderValue
-          ? acceptHeaderValue.split(';')[1]
-          : undefined;
+        const headerVersion = getMediaTypeVersion(
+          acceptHeaderValue,
+          versioningOptions.key,
+        );
 
         // No version was supplied
-        if (isUndefined(acceptHeaderVersionParameter)) {
+        if (isUndefined(headerVersion)) {
           if (Array.isArray(version)) {
             if (version.includes(VERSION_NEUTRAL)) {
               return handler(req, res, next);
             }
           }
         } else {
-          const headerVersion = acceptHeaderVersionParameter.split(
-            versioningOptions.key,
-          )[1];
-
           if (Array.isArray(version)) {
             if (version.includes(headerVersion)) {
               return handler(req, res, next);
@@ -543,6 +576,10 @@ export class ExpressAdapter extends AbstractHttpAdapter<
       default:
         return error;
     }
+  }
+
+  private normalizePrefix(prefix?: string): string {
+    return stripEndSlash(addLeadingSlash(prefix));
   }
 
   private trackOpenConnections() {

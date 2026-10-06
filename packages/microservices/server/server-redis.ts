@@ -129,9 +129,13 @@ export class ServerRedis extends Server<RedisEvents, RedisStatus> {
   public getMessageHandler(pub: Redis) {
     return this.options?.wildcards
       ? (channel: string, pattern: string, buffer: string) =>
-          this.handleMessage(channel, buffer, pub, pattern)
+          this.handleMessage(channel, buffer, pub, pattern).catch(err =>
+            this.handleError(err),
+          )
       : (channel: string, buffer: string) =>
-          this.handleMessage(channel, buffer, pub, channel);
+          this.handleMessage(channel, buffer, pub, channel).catch(err =>
+            this.handleError(err),
+          );
   }
 
   public async handleMessage(
@@ -142,14 +146,17 @@ export class ServerRedis extends Server<RedisEvents, RedisStatus> {
   ) {
     const rawMessage = this.parseMessage(buffer);
     const packet = await this.deserializer.deserialize(rawMessage, { channel });
-    const redisCtx = new RedisContext([pattern]);
+    const redisCtx = new RedisContext([pattern, packet.metadata]);
 
     if (isUndefined((packet as IncomingRequest).id)) {
       return this.handleEvent(channel, packet, redisCtx);
     }
+    // With wildcards, `channel` is the subscribed pattern (e.g. "users.*") and
+    // `pattern` is the concrete channel the request was published to. The
+    // client waits for the reply on the concrete one, so reply there.
     const publish = this.getPublisher(
       pub,
-      channel,
+      pattern,
       (packet as IncomingRequest).id,
       redisCtx,
     );
@@ -164,15 +171,11 @@ export class ServerRedis extends Server<RedisEvents, RedisStatus> {
       };
       return publish(noHandlerPacket);
     }
-    return this.onProcessingStartHook?.(
-      this.transportId,
+    return this.handleRequest(
       redisCtx,
-      async () => {
-        const response$ = this.transformToObservable(
-          await handler(packet.data, redisCtx),
-        );
-        response$ && this.send(response$, publish);
-      },
+      async () =>
+        this.transformToObservable(await handler(packet.data, redisCtx)),
+      publish,
     );
   }
 
@@ -181,7 +184,6 @@ export class ServerRedis extends Server<RedisEvents, RedisStatus> {
       Object.assign(response, { id });
       const outgoingResponse = this.serializer.serialize(response);
 
-      this.onProcessingEndHook?.(this.transportId, ctx);
       return pub.publish(
         this.getReplyPattern(pattern),
         JSON.stringify(outgoingResponse),

@@ -64,41 +64,91 @@ export class ClientMqtt extends ClientProxy<MqttEvents, MqttStatus> {
   }
 
   public async close() {
+    this.handleClose();
     if (this.mqttClient) {
       await this.mqttClient.endAsync();
     }
     this.mqttClient = null;
     this.connectionPromise = null;
+    this.isInitialConnection = false;
+    this.subscriptionsCount.clear();
     this.pendingEventListeners = [];
+  }
+
+  public handleClose() {
+    if (this.routingMap.size > 0) {
+      const err = new Error('Connection closed');
+      const callbacks = [...this.routingMap.values()];
+      this.routingMap.clear();
+
+      for (const callback of callbacks) {
+        try {
+          callback({ err });
+        } catch (callbackErr) {
+          // A failing callback must not keep the remaining requests pending
+          // nor prevent the connection from being closed.
+          this.logger.error(callbackErr);
+        }
+      }
+    }
   }
 
   public async connect(): Promise<any> {
     if (this.mqttClient) {
       return this.connectionPromise!;
     }
-    this.mqttClient = this.createClient();
-    this.registerErrorListener(this.mqttClient);
-    this.registerOfflineListener(this.mqttClient);
-    this.registerReconnectListener(this.mqttClient);
-    this.registerConnectListener(this.mqttClient);
-    this.registerDisconnectListener(this.mqttClient);
-    this.registerCloseListener(this.mqttClient);
+    const mqttClient = this.createClient();
+    this.mqttClient = mqttClient;
+    this.registerErrorListener(mqttClient);
+    this.registerOfflineListener(mqttClient);
+    this.registerReconnectListener(mqttClient);
+    this.registerConnectListener(mqttClient);
+    this.registerDisconnectListener(mqttClient);
+    this.registerCloseListener(mqttClient);
 
     this.pendingEventListeners.forEach(({ event, callback }) =>
-      this.mqttClient!.on(event, callback),
+      mqttClient.on(event, callback),
     );
-    this.pendingEventListeners = [];
 
-    const connect$ = this.connect$(this.mqttClient);
-    this.connectionPromise = lastValueFrom(
-      this.mergeCloseEvent(this.mqttClient, connect$).pipe(share()),
+    const connect$ = this.connect$(mqttClient);
+    const connectionPromise = lastValueFrom(
+      this.mergeCloseEvent(mqttClient, connect$).pipe(share()),
     ).catch(err => {
       if (err instanceof EmptyError) {
         return;
       }
+      // A client that does not reconnect on its own (reconnectPeriod 0) would
+      // otherwise stay cached as the rejected attempt, so every later
+      // connect() call replays the rejection instead of trying again.
+      if (
+        this.connectionPromise === connectionPromise &&
+        mqttClient.options?.reconnectPeriod === 0
+      ) {
+        this.discardClient(mqttClient);
+      }
       throw err;
     });
-    return this.connectionPromise;
+    this.connectionPromise = connectionPromise;
+    return connectionPromise;
+  }
+
+  /**
+   * Drops `client` when it is still the current one, so the next `connect()`
+   * call starts over with a new client. Events a dropped client emits from now
+   * on are ignored.
+   */
+  private discardClient(client: MqttClient) {
+    if (client !== this.mqttClient) {
+      return;
+    }
+    // Requests sent through the dropped client can no longer get a reply
+    this.handleClose();
+    this.mqttClient = null;
+    this.connectionPromise = null;
+    // The next client has to attach the response listener and subscribe to
+    // the reply channels again
+    this.isInitialConnection = false;
+    this.subscriptionsCount.clear();
   }
 
   public mergeCloseEvent<T = any>(
@@ -161,6 +211,13 @@ export class ClientMqtt extends ClientProxy<MqttEvents, MqttStatus> {
   public registerCloseListener(client: MqttClient) {
     client.on(MqttEventsMap.CLOSE, () => {
       this._status$.next(MqttStatus.CLOSED);
+
+      // mqtt reconnects on the same client only while reconnectPeriod is set.
+      // Once it gives up, drop the client so the next connect() call starts
+      // over instead of returning the promise of a connection that is gone.
+      if (client === this.mqttClient && !client.reconnecting) {
+        this.discardClient(client);
+      }
     });
   }
 
@@ -183,10 +240,11 @@ export class ClientMqtt extends ClientProxy<MqttEvents, MqttStatus> {
     EventKey extends keyof MqttEvents = keyof MqttEvents,
     EventCallback extends MqttEvents[EventKey] = MqttEvents[EventKey],
   >(event: EventKey, callback: EventCallback) {
+    // Kept until `close()`, so the clients created later (e.g., after a
+    // failed connect) get it as well
+    this.pendingEventListeners.push({ event, callback });
     if (this.mqttClient) {
       this.mqttClient.on(event, callback as any);
-    } else {
-      this.pendingEventListeners.push({ event, callback });
     }
   }
 
@@ -242,40 +300,72 @@ export class ClientMqtt extends ClientProxy<MqttEvents, MqttStatus> {
 
       let subscriptionsCount =
         this.subscriptionsCount.get(responseChannel) || 0;
+      let isPublished = false;
+      let isTornDown = false;
+
+      const undoBookkeeping = () => {
+        isTornDown = true;
+        isPublished = false;
+        this.subscriptionsCount.set(
+          responseChannel,
+          (this.subscriptionsCount.get(responseChannel) || 1) - 1,
+        );
+        this.routingMap.delete(packet.id);
+      };
 
       const publishPacket = () => {
+        if (isTornDown) {
+          return;
+        }
         subscriptionsCount = this.subscriptionsCount.get(responseChannel) || 0;
         this.subscriptionsCount.set(responseChannel, subscriptionsCount + 1);
         this.routingMap.set(packet.id, callback);
+        isPublished = true;
 
-        const options =
-          isObject(packet?.data) && packet.data instanceof MqttRecord
-            ? packet.data.options
-            : undefined;
-        delete packet?.data?.options;
-        const serializedPacket: string | Buffer =
-          this.serializer.serialize(packet);
+        try {
+          const options =
+            isObject(packet?.data) && packet.data instanceof MqttRecord
+              ? packet.data.options
+              : undefined;
+          delete packet?.data?.options;
+          const serializedPacket: string | Buffer =
+            this.serializer.serialize(packet);
 
-        this.mqttClient!.publish(
-          this.getRequestPattern(pattern),
-          serializedPacket,
-          this.mergePacketOptions(options),
-        );
+          this.mqttClient!.publish(
+            this.getRequestPattern(pattern),
+            serializedPacket,
+            this.mergePacketOptions(options),
+          );
+        } catch (err) {
+          // The broker can acknowledge the subscription later, so this runs
+          // outside the outer catch and has to undo its own work. Only the
+          // bookkeeping though: a concurrent request on this pattern may still
+          // be waiting for its own subscribe reply, so the broker subscription
+          // is left to self-heal, as in #17671.
+          undoBookkeeping();
+          callback({ err });
+        }
+      };
+
+      const cleanup = () => {
+        isTornDown = true;
+        if (!isPublished) {
+          return;
+        }
+        isPublished = false;
+        this.unsubscribeFromChannel(responseChannel);
+        this.routingMap.delete(packet.id);
       };
 
       if (subscriptionsCount <= 0) {
-        this.mqttClient!.subscribe(
-          responseChannel,
-          (err: any) => !err && publishPacket(),
+        this.mqttClient!.subscribe(responseChannel, (err: any) =>
+          err ? callback({ err }) : publishPacket(),
         );
       } else {
         publishPacket();
       }
 
-      return () => {
-        this.unsubscribeFromChannel(responseChannel);
-        this.routingMap.delete(packet.id);
-      };
+      return cleanup;
     } catch (err) {
       callback({ err });
       return () => {};

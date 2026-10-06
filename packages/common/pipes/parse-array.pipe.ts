@@ -82,7 +82,7 @@ export class ParseArrayPipe implements PipeTransform {
    * @param metadata contains metadata about the currently processed route argument
    */
   async transform(value: unknown, metadata: ArgumentMetadata): Promise<any> {
-    if (!value && !this.options.optional) {
+    if (isNil(value) && !this.options.optional) {
       throw this.exceptionFactory(VALIDATION_ERROR_MESSAGE);
     } else if (isNil(value) && this.options.optional) {
       return value;
@@ -166,14 +166,12 @@ export class ParseArrayPipe implements PipeTransform {
 
   protected validatePrimitive(originalValue: any, index?: number) {
     if (this.options.items === Number) {
-      const value =
-        originalValue !== null && originalValue !== '' ? +originalValue : NaN;
-      if (isNaN(value)) {
+      if (!this.isNumeric(originalValue)) {
         throw this.exceptionFactory(
           `${isUndefined(index) ? '' : `[${index}] `}item must be a number`,
         );
       }
-      return value;
+      return Number(originalValue);
     } else if (this.options.items === String) {
       if (!isString(originalValue)) {
         return `${originalValue}`;
@@ -188,5 +186,22 @@ export class ParseArrayPipe implements PipeTransform {
       }
     }
     return originalValue;
+  }
+
+  protected isNumeric(value: unknown): boolean {
+    if (typeof value === 'number') {
+      return Number.isFinite(value);
+    }
+    // Booleans, arrays and blank strings coerce to numbers (`+true === 1`,
+    // `+[2] === 2`, `+' ' === 0`), so only strings are converted.
+    if (typeof value !== 'string' || value.trim() === '') {
+      return false;
+    }
+    // Reject radix prefixes (`Number('0x10') === 16`), as ParseIntPipe and
+    // ParseFloatPipe do.
+    if (/^0[box]/i.test(value.trim())) {
+      return false;
+    }
+    return Number.isFinite(Number(value));
   }
 }

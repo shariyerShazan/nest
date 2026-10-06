@@ -54,6 +54,17 @@ describe('NestApplicationContext', () => {
   }
 
   describe('listenToShutdownSignals', () => {
+    function removeListenersNotIn(
+      signal: string,
+      baseline: Set<ReturnType<typeof process.listeners>[number]>,
+    ) {
+      process.listeners(signal).forEach(listener => {
+        if (!baseline.has(listener)) {
+          process.removeListener(signal, listener);
+        }
+      });
+    }
+
     it('shutdown process should not be interrupted by another handler', async () => {
       const signal = 'SIGTERM';
       let processUp = true;
@@ -62,7 +73,8 @@ describe('NestApplicationContext', () => {
       applicationContext.enableShutdownHooks([signal]);
 
       const waitProcessDown = new Promise(resolve => {
-        const shutdownCleanupRef = applicationContext['shutdownCleanupRef'];
+        const shutdownCleanupRef =
+          applicationContext['shutdownCleanupRefs'].get(signal);
         const handler = () => {
           if (
             !process
@@ -98,6 +110,255 @@ describe('NestApplicationContext', () => {
       hookStub.mockRestore();
       expect(processUp).toBe(false);
       expect(promisesResolved).toBe(true);
+    });
+
+    it('should normalize signals before removing duplicates', async () => {
+      const signal = 'SIGTERM';
+      const listeners = new Set(process.listeners(signal));
+      const applicationContext = await testHelper(A, Scope.DEFAULT);
+
+      try {
+        applicationContext.enableShutdownHooks(['sigterm', ' SIGTERM ']);
+
+        expect(process.listenerCount(signal)).toBe(listeners.size + 1);
+
+        await applicationContext.close();
+
+        expect(process.listenerCount(signal)).toBe(listeners.size);
+      } finally {
+        removeListenersNotIn(signal, listeners);
+      }
+    });
+
+    it('should remove the listener when the same signal is registered by separate calls', async () => {
+      const signal = 'SIGTERM';
+      const listeners = new Set(process.listeners(signal));
+      const applicationContext = await testHelper(A, Scope.DEFAULT);
+
+      try {
+        applicationContext.enableShutdownHooks([signal]);
+        applicationContext.enableShutdownHooks([signal]);
+
+        expect(process.listenerCount(signal)).toBe(listeners.size + 1);
+
+        await applicationContext.close();
+
+        expect(process.listenerCount(signal)).toBe(listeners.size);
+      } finally {
+        removeListenersNotIn(signal, listeners);
+      }
+    });
+
+    it('should allow shutdown hooks to be enabled after close', async () => {
+      const signal = 'SIGTERM';
+      const listeners = new Set(process.listeners(signal));
+      const applicationContext = await testHelper(A, Scope.DEFAULT);
+
+      try {
+        applicationContext.enableShutdownHooks([signal]);
+        expect(process.listenerCount(signal)).toBe(listeners.size + 1);
+
+        await applicationContext.close();
+        expect(process.listenerCount(signal)).toBe(listeners.size);
+
+        applicationContext.enableShutdownHooks([signal]);
+
+        expect(process.listenerCount(signal)).toBe(listeners.size + 1);
+
+        await applicationContext.close();
+        expect(process.listenerCount(signal)).toBe(listeners.size);
+      } finally {
+        removeListenersNotIn(signal, listeners);
+      }
+    });
+
+    it('should run shutdown hooks once when a signal arrives during close', async () => {
+      const signal = 'SIGTERM';
+      const listeners = new Set(process.listeners(signal));
+      const applicationContext = await testHelper(A, Scope.DEFAULT);
+      const processExitStub = vi
+        .spyOn(process, 'exit')
+        .mockImplementation(() => ({}) as any);
+      const processKillStub = vi
+        .spyOn(process, 'kill')
+        .mockImplementation(() => true);
+
+      let releaseDestroyHook: () => void;
+      const destroyHookCalled = new Promise<void>(resolve => {
+        releaseDestroyHook = resolve;
+      });
+      const destroyHookStub = vi
+        .spyOn(applicationContext as any, 'callDestroyHook')
+        .mockImplementation(async () => {
+          releaseDestroyHook();
+          await new Promise(resolve => setTimeout(resolve, 10));
+        });
+      const hookStub = vi
+        .spyOn(applicationContext as any, 'callShutdownHook')
+        .mockImplementation(async () => undefined);
+
+      try {
+        applicationContext.enableShutdownHooks([signal]);
+        const cleanup = applicationContext['shutdownCleanupRefs'].get(signal)!;
+
+        // Start a programmatic close, then deliver a signal while the
+        // destroy hook of that close is still in flight.
+        const closing = applicationContext.close();
+        await destroyHookCalled;
+        await cleanup(signal);
+        await closing;
+
+        expect(destroyHookStub).toHaveBeenCalledTimes(1);
+        expect(hookStub).toHaveBeenCalledTimes(1);
+        expect(process.listenerCount(signal)).toBe(listeners.size);
+      } finally {
+        destroyHookStub.mockRestore();
+        hookStub.mockRestore();
+        processKillStub.mockRestore();
+        processExitStub.mockRestore();
+        removeListenersNotIn(signal, listeners);
+      }
+    });
+
+    it('should not get stuck when the shutdown sequence throws', async () => {
+      const signal = 'SIGTERM';
+      const listeners = new Set(process.listeners(signal));
+      const applicationContext = await testHelper(A, Scope.DEFAULT);
+      const processExitStub = vi
+        .spyOn(process, 'exit')
+        .mockImplementation(() => ({}) as any);
+      const processKillStub = vi
+        .spyOn(process, 'kill')
+        .mockImplementation(() => true);
+      const hookStub = vi
+        .spyOn(applicationContext as any, 'callShutdownHook')
+        .mockRejectedValueOnce(new Error('shutdown hook failed'))
+        .mockImplementation(async () => undefined);
+
+      try {
+        applicationContext.enableShutdownHooks([signal]);
+        await applicationContext['shutdownCleanupRefs'].get(signal)!(signal);
+
+        expect(processExitStub).toHaveBeenCalledWith(1);
+
+        // The failed cycle must not latch the guard: closing the context
+        // afterwards still runs the shutdown sequence.
+        await applicationContext.close();
+
+        expect(hookStub).toHaveBeenCalledTimes(2);
+        expect(process.listenerCount(signal)).toBe(listeners.size);
+      } finally {
+        hookStub.mockRestore();
+        processKillStub.mockRestore();
+        processExitStub.mockRestore();
+        removeListenersNotIn(signal, listeners);
+      }
+    });
+
+    it('should allow shutdown hooks to run after being re-enabled', async () => {
+      const signal = 'SIGTERM';
+      const listeners = new Set(process.listeners(signal));
+      const applicationContext = await testHelper(A, Scope.DEFAULT);
+      const processExitStub = vi
+        .spyOn(process, 'exit')
+        .mockImplementation(() => ({}) as any);
+      const processKillStub = vi
+        .spyOn(process, 'kill')
+        .mockImplementation(() => true);
+      const hookStub = vi
+        .spyOn(applicationContext as any, 'callShutdownHook')
+        .mockImplementation(async () => undefined);
+
+      try {
+        applicationContext.enableShutdownHooks([signal]);
+        await applicationContext['shutdownCleanupRefs'].get(signal)!(signal);
+
+        applicationContext.enableShutdownHooks([signal]);
+        await applicationContext['shutdownCleanupRefs'].get(signal)!(signal);
+
+        expect(hookStub).toHaveBeenCalledTimes(2);
+        expect(processKillStub).toHaveBeenCalledTimes(2);
+      } finally {
+        hookStub.mockRestore();
+        processKillStub.mockRestore();
+        processExitStub.mockRestore();
+        removeListenersNotIn(signal, listeners);
+      }
+    });
+
+    it('should remove signal listeners registered by separate calls', async () => {
+      const signals = ['SIGTERM', 'SIGINT'];
+      const listeners = signals.map(
+        signal => new Set(process.listeners(signal)),
+      );
+      const applicationContext = await testHelper(A, Scope.DEFAULT);
+
+      try {
+        applicationContext.enableShutdownHooks([signals[0]]);
+        applicationContext.enableShutdownHooks([signals[1]]);
+
+        signals.forEach((signal, index) => {
+          expect(process.listenerCount(signal)).toBe(listeners[index].size + 1);
+        });
+
+        await applicationContext.close();
+
+        signals.forEach((signal, index) => {
+          expect(process.listenerCount(signal)).toBe(listeners[index].size);
+        });
+      } finally {
+        signals.forEach((signal, index) => {
+          removeListenersNotIn(signal, listeners[index]);
+        });
+      }
+    });
+
+    it('should run shutdown hooks once across separate registrations', async () => {
+      const signals = ['SIGTERM', 'SIGINT'];
+      const listeners = signals.map(
+        signal => new Set(process.listeners(signal)),
+      );
+      const applicationContext = await testHelper(A, Scope.DEFAULT);
+      const processExitStub = vi
+        .spyOn(process, 'exit')
+        .mockImplementation(() => ({}) as any);
+      const processKillStub = vi
+        .spyOn(process, 'kill')
+        .mockImplementation(() => true);
+      const hookStub = vi
+        .spyOn(applicationContext as any, 'callShutdownHook')
+        .mockImplementation(async () => undefined);
+
+      try {
+        applicationContext.enableShutdownHooks([signals[0]]);
+        applicationContext.enableShutdownHooks([signals[1]]);
+
+        signals.forEach((signal, index) => {
+          expect(process.listenerCount(signal)).toBe(listeners[index].size + 1);
+        });
+
+        const cleanupHandlers = signals.map(signal =>
+          applicationContext['shutdownCleanupRefs'].get(signal),
+        );
+
+        await Promise.all([
+          cleanupHandlers[0]!(signals[0]),
+          cleanupHandlers[1]!(signals[1]),
+        ]);
+
+        expect(hookStub).toHaveBeenCalledTimes(1);
+        expect(processKillStub).toHaveBeenCalledTimes(1);
+        signals.forEach((signal, index) => {
+          expect(process.listenerCount(signal)).toBe(listeners[index].size);
+        });
+      } finally {
+        hookStub.mockRestore();
+        processKillStub.mockRestore();
+        processExitStub.mockRestore();
+        signals.forEach((signal, index) => {
+          removeListenersNotIn(signal, listeners[index]);
+        });
+      }
     });
 
     it('should defer shutdown until all init hooks are resolved', async () => {
@@ -157,6 +418,102 @@ describe('NestApplicationContext', () => {
       vi.useRealTimers();
     });
 
+    it('should run shutdown hooks when a signal arrives after a failed init', async () => {
+      const signal = 'SIGTERM';
+      const listeners = new Set(process.listeners(signal));
+      const onApplicationShutdownStub = vi.fn();
+
+      class B {
+        onModuleInit() {
+          throw new Error('init failed');
+        }
+
+        onApplicationShutdown() {
+          onApplicationShutdownStub();
+        }
+      }
+
+      const applicationContext = await testHelper(A, Scope.DEFAULT, [
+        { provide: B, useClass: B, scope: Scope.DEFAULT },
+      ]);
+      const processExitStub = vi
+        .spyOn(process, 'exit')
+        .mockImplementation(() => ({}) as any);
+      const processKillStub = vi
+        .spyOn(process, 'kill')
+        .mockImplementation(() => true);
+
+      try {
+        applicationContext.enableShutdownHooks([signal]);
+        await expect(applicationContext.init()).rejects.toThrow('init failed');
+        await applicationContext['shutdownCleanupRefs'].get(signal)!(signal);
+
+        expect(onApplicationShutdownStub).toHaveBeenCalledTimes(1);
+        expect(processKillStub).toHaveBeenCalledWith(process.pid, signal);
+        expect(processExitStub).not.toHaveBeenCalled();
+      } finally {
+        processKillStub.mockRestore();
+        processExitStub.mockRestore();
+        removeListenersNotIn(signal, listeners);
+      }
+    });
+
+    it('should defer shutdown until a failing init settles, then run it', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout'] });
+      const signal = 'SIGTERM';
+      const listeners = new Set(process.listeners(signal));
+      const onApplicationShutdownStub = vi.fn();
+      const delay = (ms: number) =>
+        new Promise<void>(resolve => globalThis.setTimeout(resolve, ms));
+
+      class B {
+        async onModuleInit() {
+          await delay(5000);
+          throw new Error('init failed');
+        }
+
+        onApplicationShutdown() {
+          onApplicationShutdownStub();
+        }
+      }
+
+      const applicationContext = await testHelper(A, Scope.DEFAULT, [
+        { provide: B, useClass: B, scope: Scope.DEFAULT },
+      ]);
+      const processExitStub = vi
+        .spyOn(process, 'exit')
+        .mockImplementation(() => ({}) as any);
+      const processKillStub = vi
+        .spyOn(process, 'kill')
+        .mockImplementation(() => true);
+
+      try {
+        applicationContext.enableShutdownHooks([signal]);
+        const initError = applicationContext.init().then(
+          () => undefined,
+          (error: Error) => error,
+        );
+        const shutdown =
+          applicationContext['shutdownCleanupRefs'].get(signal)!(signal);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(onApplicationShutdownStub).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(5000);
+        await shutdown;
+
+        expect((await initError)?.message).toBe('init failed');
+        expect(onApplicationShutdownStub).toHaveBeenCalledTimes(1);
+        expect(processKillStub).toHaveBeenCalledWith(process.pid, signal);
+        expect(processExitStub).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+        processKillStub.mockRestore();
+        processExitStub.mockRestore();
+        removeListenersNotIn(signal, listeners);
+      }
+    });
+
     it('should use process.exit when useProcessExit option is enabled', async () => {
       const signal = 'SIGTERM';
       const applicationContext = await testHelper(A, Scope.DEFAULT);
@@ -176,7 +533,8 @@ describe('NestApplicationContext', () => {
         .spyOn(applicationContext as any, 'callShutdownHook')
         .mockImplementation(async () => undefined);
 
-      const shutdownCleanupRef = applicationContext['shutdownCleanupRef']!;
+      const shutdownCleanupRef =
+        applicationContext['shutdownCleanupRefs'].get(signal)!;
       await shutdownCleanupRef(signal);
 
       expect(processExitStub).toHaveBeenCalledWith(0);
@@ -204,7 +562,8 @@ describe('NestApplicationContext', () => {
         .spyOn(applicationContext as any, 'callShutdownHook')
         .mockImplementation(async () => undefined);
 
-      const shutdownCleanupRef = applicationContext['shutdownCleanupRef']!;
+      const shutdownCleanupRef =
+        applicationContext['shutdownCleanupRefs'].get(signal)!;
       await shutdownCleanupRef(signal);
 
       expect(processKillStub).toHaveBeenCalledWith(process.pid, signal);
@@ -213,6 +572,43 @@ describe('NestApplicationContext', () => {
       hookStub.mockRestore();
       processExitStub.mockRestore();
       processKillStub.mockRestore();
+    });
+  });
+
+  describe('close', () => {
+    it('should run the shutdown sequence after a failed init', async () => {
+      const onModuleDestroyStub = vi.fn();
+      const beforeApplicationShutdownStub = vi.fn();
+      const onApplicationShutdownStub = vi.fn();
+
+      class B {
+        onModuleInit() {
+          throw new Error('init failed');
+        }
+
+        onModuleDestroy() {
+          onModuleDestroyStub();
+        }
+
+        beforeApplicationShutdown() {
+          beforeApplicationShutdownStub();
+        }
+
+        onApplicationShutdown() {
+          onApplicationShutdownStub();
+        }
+      }
+
+      const applicationContext = await testHelper(A, Scope.DEFAULT, [
+        { provide: B, useClass: B, scope: Scope.DEFAULT },
+      ]);
+
+      await expect(applicationContext.init()).rejects.toThrow('init failed');
+      await applicationContext.close();
+
+      expect(onModuleDestroyStub).toHaveBeenCalledTimes(1);
+      expect(beforeApplicationShutdownStub).toHaveBeenCalledTimes(1);
+      expect(onApplicationShutdownStub).toHaveBeenCalledTimes(1);
     });
   });
 

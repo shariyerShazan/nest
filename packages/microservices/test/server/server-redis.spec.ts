@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { of } from 'rxjs';
 import { NO_MESSAGE_HANDLER } from '../../constants.js';
 import { BaseRpcContext } from '../../ctx-host/base-rpc.context.js';
 import { RedisContext } from '../../ctx-host/index.js';
@@ -111,6 +112,21 @@ describe('ServerRedis', () => {
       server.bindEvents(sub, null);
       expect(onSpy.mock.calls[0][0]).toBe('message');
     });
+    it('should route "handleMessage" rejections to "handleError" instead of leaving them unhandled', async () => {
+      const error = new Error('unexpected');
+      vi.spyOn(server, 'handleMessage').mockRejectedValue(error);
+      const handleErrorSpy = vi
+        .spyOn(untypedServer, 'handleError')
+        .mockImplementation(() => undefined);
+
+      server.bindEvents(sub, null);
+      const [, onMessage] = onSpy.mock.calls.find(
+        ([event]) => event === 'message',
+      )!;
+      await onMessage('channel', 'buffer');
+
+      expect(handleErrorSpy).toHaveBeenCalledWith(error);
+    });
     it('should bind "pmessage" event to handler if wildcards are enabled', () => {
       untypedServer.options = {};
       untypedServer.options.wildcards = true;
@@ -196,6 +212,92 @@ describe('ServerRedis', () => {
 
       await server.handleMessage(channel, '', null, channel);
       expect(handler).toHaveBeenCalledWith(data, expect.any(RedisContext));
+    });
+    it('should expose the packet metadata on the context', async () => {
+      const handler = vi.fn();
+      const metadata = { traceId: 'trace-1' };
+      untypedServer.messageHandlers = objectToMap({
+        [channel]: handler,
+      });
+      vi.spyOn(server, 'parseMessage').mockImplementation(
+        () => ({ id, data, metadata }) as any,
+      );
+
+      await server.handleMessage(channel, '', null, channel);
+
+      const context: RedisContext = handler.mock.calls[0][1];
+      expect(context.getMetadata()).toEqual(metadata);
+    });
+    it('should publish the reply to the channel the request came from when wildcards are enabled', async () => {
+      // ioredis emits "pmessage" with (pattern, channel, message). With
+      // wildcards the handler is registered on the pattern ("users.*"), but
+      // the client waits for the reply on the concrete channel it published
+      // to ("users.created.reply"), so the reply must target that channel.
+      untypedServer.options.wildcards = true;
+      const handler = vi.fn();
+      untypedServer.messageHandlers = objectToMap({
+        'users.*': handler,
+      });
+      vi.spyOn(server, 'parseMessage').mockImplementation(
+        () => ({ id, data }) as any,
+      );
+
+      await server.handleMessage('users.*', '', null, 'users.created');
+
+      expect(handler).toHaveBeenCalledWith(data, expect.any(RedisContext));
+      expect(server.getPublisher).toHaveBeenCalledWith(
+        null,
+        'users.created',
+        id,
+        expect.any(RedisContext),
+      );
+    });
+  });
+
+  describe('processing end hook', () => {
+    const channel = 'test';
+    const id = '3';
+    let publishSpy: ReturnType<typeof vi.fn>;
+    let endHook: ReturnType<typeof vi.fn>;
+
+    const bindHandler = (handler: () => unknown) => {
+      publishSpy = vi.fn();
+      vi.spyOn(server, 'getPublisher').mockImplementation(() => publishSpy);
+      vi.spyOn(server, 'parseMessage').mockImplementation(
+        () => ({ id, data: 'test' }) as any,
+      );
+      endHook = vi.fn();
+      untypedServer.onProcessingStartHook = (
+        _transportId: unknown,
+        _ctx: unknown,
+        fn: () => Promise<void>,
+      ) => fn();
+      untypedServer.onProcessingEndHook = endHook;
+      untypedServer.messageHandlers = objectToMap({
+        [channel]: (async () => handler()) as any,
+      });
+    };
+    const handleMessage = () =>
+      server.handleMessage(channel, JSON.stringify({ id }), null!, channel);
+    const flush = () => new Promise(resolve => setImmediate(resolve));
+
+    it('should run the hook once when the response stream emits several values', async () => {
+      bindHandler(() => of('first', 'second', 'third'));
+
+      await handleMessage();
+      await flush();
+
+      expect(publishSpy).toHaveBeenCalledTimes(3);
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+    it('should run the hook when the handler rejects', async () => {
+      bindHandler(() => {
+        throw new Error('handler failed');
+      });
+
+      await expect(handleMessage()).rejects.toThrow('handler failed');
+
+      expect(endHook).toHaveBeenCalledOnce();
     });
   });
   describe('getPublisher', () => {

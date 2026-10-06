@@ -5,6 +5,7 @@ import {
   RuntimeException,
   UnknownExportException,
 } from '../errors/exceptions/index.js';
+import { InvalidProviderException } from '../errors/exceptions/invalid-provider.exception.js';
 import { createContextId } from '../helpers/context-id-factory.js';
 import { getClassScope } from '../helpers/get-class-scope.js';
 import { isDurable } from '../helpers/is-durable.js';
@@ -318,6 +319,11 @@ export class Module {
       this.addCustomFactory(provider, collection, enhancerSubtype);
     } else if (this.isCustomUseExisting(provider)) {
       this.addCustomUseExisting(provider, collection, enhancerSubtype);
+    } else {
+      throw new InvalidProviderException(
+        (provider as ClassProvider).provide,
+        this.name,
+      );
     }
     return provider.provide;
   }
@@ -329,7 +335,7 @@ export class Module {
   public isCustomValue(provider: any): provider is ValueProvider {
     return (
       isObject(provider) &&
-      Object.prototype.hasOwnProperty.call(provider, 'useValue')
+      Object.hasOwn(provider, 'useValue')
     );
   }
 

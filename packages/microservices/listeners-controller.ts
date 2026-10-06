@@ -1,4 +1,5 @@
 import {
+  defaultIfEmpty,
   forkJoin,
   from as fromPromise,
   isObservable,
@@ -115,6 +116,7 @@ export class ListenersController {
             STATIC_CONTEXT,
             undefined,
             defaultCallMetadata,
+            isEventHandler && !serverInstance.propagatesEventHandlerErrors,
           );
           if (isEventHandler) {
             const eventHandler: MessageHandler = async (...args: unknown[]) => {
@@ -153,6 +155,7 @@ export class ListenersController {
           methodKey,
           defaultCallMetadata,
           isEventHandler,
+          isEventHandler && !serverInstance.propagatesEventHandlerErrors,
         );
         serverInstance.addHandler(
           pattern,
@@ -198,9 +201,15 @@ export class ListenersController {
       const returnedValueWrapper = handlerRef.next(
         ...(originalArgs as Parameters<MessageHandler>),
       );
+      // `forkJoin` completes silently and unsubscribes the other sources as
+      // soon as one completes empty, which would cancel the sibling handlers.
       return forkJoin({
-        current: this.transformToObservable(currentReturnValue),
-        next: this.transformToObservable(returnedValueWrapper),
+        current: this.transformToObservable(currentReturnValue).pipe(
+          defaultIfEmpty(undefined),
+        ),
+        next: this.transformToObservable(returnedValueWrapper).pipe(
+          defaultIfEmpty(undefined),
+        ),
       });
     }
     return currentReturnValue;
@@ -234,6 +243,7 @@ export class ListenersController {
     methodKey: string,
     defaultCallMetadata: Record<string, any> = DEFAULT_CALLBACK_METADATA,
     isEventHandler = false,
+    reportUnhandledErrors = false,
   ) {
     const collection = moduleRef.controllers;
     const { instance } = wrapper;
@@ -273,6 +283,7 @@ export class ListenersController {
           contextId,
           wrapper.id,
           defaultCallMetadata,
+          reportUnhandledErrors,
         );
 
         const returnValue = proxy(...args);

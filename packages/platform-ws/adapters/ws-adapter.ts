@@ -4,7 +4,14 @@ import * as http from 'http';
 import { createRequire } from 'module';
 import type { Duplex } from 'stream';
 import { EMPTY, fromEvent, Observable } from 'rxjs';
-import { filter, first, mergeMap, share, takeUntil } from 'rxjs/operators';
+import {
+  catchError,
+  filter,
+  first,
+  mergeMap,
+  share,
+  takeUntil,
+} from 'rxjs/operators';
 import { loadPackageSync, isNil, normalizePath } from '@nestjs/common/internal';
 import {
   CLOSE_EVENT,
@@ -159,6 +166,13 @@ export class WsAdapter extends AbstractWsAdapter {
       mergeMap(data =>
         this.bindMessageHandler(data, handlersMap, transform).pipe(
           filter(result => !isNil(result)),
+          // a handler that rejects through an error filter that rethrows
+          // would error the client's stream and silence every later message;
+          // that rethrow is an app bug, so it gets logged, not dropped silently
+          catchError(err => {
+            this.logger.error(err);
+            return EMPTY;
+          }),
         ),
       ),
       takeUntil(close$),
@@ -167,7 +181,18 @@ export class WsAdapter extends AbstractWsAdapter {
       if (client.readyState !== READY_STATE.OPEN_STATE) {
         return;
       }
-      client.send(JSON.stringify(response));
+      // JSON.stringify throws on circular structures and BigInts, and on
+      // client-controlled payloads nested deep enough to overflow its native
+      // recursion (JSON.parse accepts any depth). A throw here escapes the
+      // subscriber, which RxJS rethrows asynchronously, killing the process.
+      let payload: string;
+      try {
+        payload = JSON.stringify(response);
+      } catch (err) {
+        this.logger.error(err);
+        return;
+      }
+      client.send(payload);
     };
     source$.subscribe(onMessage);
   }

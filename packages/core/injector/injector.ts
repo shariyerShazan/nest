@@ -31,6 +31,7 @@ import { UnknownDependenciesException } from '../errors/exceptions/unknown-depen
 import { Barrier } from '../helpers/barrier.js';
 import { makeSafeInstanceDecorator } from '../helpers/safe-instance-decorator.js';
 import { STATIC_CONTEXT } from './constants.js';
+import { isDebugMode } from './helpers/is-debug-mode.util.js';
 import { INQUIRER } from './inquirer/index.js';
 import {
   ContextId,
@@ -480,10 +481,9 @@ export class Injector {
       }
       return item;
     };
-    return [
-      wrapper.inject?.map?.(mapFactoryProviderInjectArray) as any[],
-      optionalDependenciesIds,
-    ];
+    const inject = wrapper.inject ?? [];
+    const dependencies = Array.from(inject, mapFactoryProviderInjectArray);
+    return [dependencies, optionalDependenciesIds];
   }
 
   public reflectConstructorParams(type: Type<unknown> | Function): any[] {
@@ -497,7 +497,32 @@ export class Injector {
   }
 
   public reflectOptionalParams(type: Type<unknown> | Function): any[] {
-    return Reflect.getOwnMetadata(OPTIONAL_DEPS_METADATA, type) || [];
+    const ctorOwner = this.getConstructorOwner(type);
+    return Reflect.getOwnMetadata(OPTIONAL_DEPS_METADATA, ctorOwner) || [];
+  }
+
+  /**
+   * Returns the class in the prototype chain that declares the constructor
+   * `type` is instantiated with. A subclass without its own constructor
+   * inherits both the parent's parameter types and its `@Optional()` flags,
+   * while a subclass that redeclares the constructor must not inherit the
+   * parent's flags, as its parameters are unrelated to the parent's.
+   */
+  private getConstructorOwner(
+    type: Type<unknown> | Function,
+  ): Type<unknown> | Function {
+    let current: Type<unknown> | Function | null = type;
+    while (isFunction(current) && current !== Function.prototype) {
+      if (
+        Reflect.hasOwnMetadata(PARAMTYPES_METADATA, current) ||
+        Reflect.hasOwnMetadata(OPTIONAL_DEPS_METADATA, current) ||
+        Reflect.hasOwnMetadata(SELF_DECLARED_DEPS_METADATA, current)
+      ) {
+        return current;
+      }
+      current = Object.getPrototypeOf(current);
+    }
+    return type;
   }
 
   public reflectSelfParams(type: Type<unknown> | Function): any[] {
@@ -576,9 +601,7 @@ export class Injector {
       inquirerId,
     );
     if (!instanceHost.isResolved && !instanceWrapper.forwardRef) {
-      resolutionContext.inquirer?.settlementSignal?.insertRef(
-        instanceWrapper.id,
-      );
+      resolutionContext.inquirer?.settlementSignal?.insertRef(instanceWrapper);
 
       await this.loadProvider(
         instanceWrapper,
@@ -772,6 +795,7 @@ export class Injector {
         metadata,
         resolutionContext.contextId,
         resolutionContext.inquirer,
+        parentInquirer,
       );
     }
     const properties = this.reflectProperties(wrapper.metatype as Type<any>);
@@ -952,11 +976,11 @@ export class Injector {
     wrapper: InstanceWrapper,
     ctx: ContextId,
     inquirer?: InstanceWrapper,
+    enhancers: InstanceWrapper[] = wrapper.getEnhancersMetadata() || [],
   ) {
     if (ctx === STATIC_CONTEXT) {
       return;
     }
-    const enhancers = wrapper.getEnhancersMetadata() || [];
     const loadEnhancer = (item: InstanceWrapper) => {
       const hostModule = item.host!;
       return this.loadInstance(
@@ -1004,26 +1028,35 @@ export class Injector {
     metadata: PropertyMetadata[],
     contextId: ContextId,
     inquirer?: InstanceWrapper,
+    parentInquirer?: InstanceWrapper,
   ): Promise<PropertyDependency[]> {
     const dependenciesHosts = await Promise.all(
       metadata.map(async ({ wrapper: item, key }) => ({
         key,
-        host: await this.resolveComponentHost(
-          item.host!,
+        host: await this.resolveScopedComponentHost(
           item,
-          this.createResolutionContext(contextId, inquirer),
+          contextId,
+          inquirer,
+          parentInquirer,
         ),
       })),
     );
-    const inquirerId = this.getInquirerId(inquirer);
-    return dependenciesHosts.map(({ key, host }) => ({
-      key,
-      name: key,
-      instance: host.getInstanceByContextId(
-        this.getContextId(contextId, host),
-        inquirerId,
-      ).instance,
-    }));
+    return dependenciesHosts.map(({ key, host }, index) => {
+      const effectiveInquirerId = this.getEffectiveInquirerId(
+        metadata[index].wrapper,
+        this.createResolutionContext(contextId, inquirer),
+        parentInquirer,
+      );
+
+      return {
+        key,
+        name: key,
+        instance: host?.getInstanceByContextId(
+          this.getContextId(contextId, host),
+          effectiveInquirerId,
+        ).instance,
+      };
+    });
   }
 
   private getInquirerId(
@@ -1268,7 +1301,7 @@ export class Injector {
     token: InjectionToken,
     inquirer?: InstanceWrapper,
   ): void {
-    if (!this.isDebugMode()) {
+    if (!isDebugMode()) {
       return;
     }
     const tokenName = this.getTokenName(token);
@@ -1289,7 +1322,7 @@ export class Injector {
     token: InjectionToken,
     moduleRef: Module,
   ): void {
-    if (!this.isDebugMode()) {
+    if (!isDebugMode()) {
       return;
     }
     const tokenName = this.getTokenName(token);
@@ -1305,7 +1338,7 @@ export class Injector {
     token: InjectionToken,
     moduleRef: Module,
   ): void {
-    if (!this.isDebugMode()) {
+    if (!isDebugMode()) {
       return;
     }
     const tokenName = this.getTokenName(token);
@@ -1315,10 +1348,6 @@ export class Injector {
         ' in ',
       )}${clc.magentaBright(moduleRefName)}`,
     );
-  }
-
-  private isDebugMode(): boolean {
-    return !!process.env.NEST_DEBUG;
   }
 
   private getContextId(

@@ -16,7 +16,7 @@ import {
   finalize,
   mergeMap,
 } from 'rxjs/operators';
-import { NO_EVENT_HANDLER } from '../constants.js';
+import { NO_EVENT_HANDLER, UNSERIALIZABLE_PATTERN } from '../constants.js';
 import { BaseRpcContext } from '../ctx-host/base-rpc.context.js';
 import { IncomingRequestDeserializer } from '../deserializers/incoming-request.deserializer.js';
 import { Transport } from '../enums/index.js';
@@ -39,7 +39,11 @@ import { ConsumerSerializer } from '../interfaces/serializer.interface.js';
 import { IdentitySerializer } from '../serializers/identity.serializer.js';
 import { transformPatternToRoute } from '../utils/index.js';
 import { ITransportServer, Logger, type LoggerService } from '@nestjs/common';
-import { loadPackage, loadPackageSync } from '@nestjs/common/internal';
+import {
+  isString,
+  loadPackage,
+  loadPackageSync,
+} from '@nestjs/common/internal';
 
 /**
  * @publicApi
@@ -55,6 +59,13 @@ export abstract class Server<
 
   protected readonly messageHandlers = new Map<string, MessageHandler>();
   protected readonly logger: LoggerService = new Logger(Server.name);
+  /**
+   * Whether this transport hands an event handler failure to its client
+   * library, which then reports it. The base `handleEvent` connects the
+   * stream without subscribing, so nothing observes the failure and Nest logs
+   * it instead. `ServerKafka` awaits the stream and sets this to `true`.
+   */
+  public readonly propagatesEventHandlerErrors: boolean = false;
   protected serializer: ConsumerSerializer;
   protected deserializer: ConsumerDeserializer;
   protected onProcessingStartHook: (
@@ -186,8 +197,15 @@ export abstract class Server<
         process.nextTick(async () => {
           while (dataQueue.length > 0) {
             const packet = dataQueue.shift();
-            if (packet) {
+            if (!packet) {
+              continue;
+            }
+            try {
               await respond(packet);
+            } catch (err) {
+              // A reply that cannot be published must neither surface as an
+              // unhandled rejection nor stop the replies queued behind it.
+              this.logger.error(err);
             }
           }
           isProcessing = false;
@@ -214,15 +232,11 @@ export abstract class Server<
     if (!handler) {
       return this.logger.error(NO_EVENT_HANDLER`${pattern}`);
     }
-    return this.onProcessingStartHook(this.transportId!, context, async () => {
+    return this.runWithProcessingHooks(context, async runEndHook => {
       const resultOrStream = await handler(packet.data, context);
       if (isObservable(resultOrStream)) {
         const connectableSource = connectable(
-          resultOrStream.pipe(
-            finalize(() =>
-              this.onProcessingEndHook?.(this.transportId!, context),
-            ),
-          ),
+          resultOrStream.pipe(finalize(runEndHook)),
           {
             connector: () => new Subject(),
             resetOnDisconnect: false,
@@ -230,9 +244,71 @@ export abstract class Server<
         );
         connectableSource.connect();
       } else {
-        this.onProcessingEndHook?.(this.transportId!, context);
+        runEndHook();
       }
     });
+  }
+
+  /**
+   * Handles a request-response message. `produce` returns the response
+   * stream, whose values are replied through `respond`, and the processing
+   * end hook runs once that stream settles (or once `produce` rejects).
+   */
+  protected handleRequest(
+    context: BaseRpcContext,
+    produce: () => Promise<Observable<any>>,
+    respond: (data: WritePacket) => Promise<unknown> | void,
+  ) {
+    return this.runWithProcessingHooks(context, async runEndHook => {
+      const response$ = await produce();
+      this.send(response$.pipe(finalize(runEndHook)), respond);
+    });
+  }
+
+  /**
+   * Runs `fn` between the processing start and end hooks.
+   *
+   * `fn` receives a runner that closes the span exactly once and attaches it
+   * to the teardown of whatever stream it produces. If `fn` rejects before
+   * that teardown can run, the span is closed here and the rejection travels
+   * on to the transport's client library.
+   *
+   * `endHookContext` is for transports that report a different context to
+   * the end hook than to the start hook (gRPC passes the request).
+   */
+  protected runWithProcessingHooks(
+    context: BaseRpcContext,
+    fn: (runEndHook: () => void) => Promise<void>,
+    endHookContext: BaseRpcContext = context,
+  ) {
+    return this.onProcessingStartHook(this.transportId!, context, async () => {
+      const runEndHook = this.createProcessingEndHookRunner(endHookContext);
+      try {
+        await fn(runEndHook);
+      } catch (err) {
+        runEndHook();
+        throw err;
+      }
+    });
+  }
+
+  /**
+   * Returns a function that runs the processing end hook exactly once.
+   *
+   * An event handler can fail either by rejecting or by returning a stream
+   * that errors, and `ServerKafka#handleEvent` awaits that stream, so both the
+   * `finalize` teardown and the `catch` block can be reached for a single
+   * event. The hook closes a span, so it must not run twice.
+   */
+  protected createProcessingEndHookRunner(context: BaseRpcContext): () => void {
+    let isEndHookCalled = false;
+    return () => {
+      if (isEndHookCalled) {
+        return;
+      }
+      isEndHookCalled = true;
+      this.onProcessingEndHook?.(this.transportId!, context);
+    };
   }
 
   public transformToObservable<T>(
@@ -348,5 +424,26 @@ export abstract class Server<
 
   protected normalizePattern(pattern: MsPattern): string {
     return transformPatternToRoute(pattern);
+  }
+
+  /**
+   * Returns the string representation of an incoming message pattern.
+   *
+   * Patterns are client-controlled: serializing a deeply nested one makes
+   * `JSON.stringify` throw a `RangeError`, which must not escape the message
+   * handler (as an unhandled promise rejection that terminates the process).
+   *
+   * @param  {unknown} pattern - client pattern
+   * @returns string
+   */
+  protected getPatternAsString(pattern: unknown): string {
+    if (isString(pattern)) {
+      return pattern;
+    }
+    try {
+      return JSON.stringify(pattern);
+    } catch {
+      return UNSERIALIZABLE_PATTERN;
+    }
   }
 }

@@ -1,6 +1,14 @@
 import { FastifyAdapter } from '../../adapters/fastify-adapter';
 import { createError } from '@fastify/error';
-import { HttpException } from '@nestjs/common';
+import {
+  HttpException,
+  Logger,
+  RawBodyRequest,
+  VERSION_NEUTRAL,
+  VersioningOptions,
+  VersioningType,
+} from '@nestjs/common';
+import { FastifyReply, FastifyRequest } from 'fastify';
 
 describe('FastifyAdapter', () => {
   let fastifyAdapter: FastifyAdapter;
@@ -48,6 +56,54 @@ describe('FastifyAdapter', () => {
         expect(reply.status).toHaveBeenCalledWith(statusCode);
       }
     });
+
+    it('should keep a JSON content type that carries parameters', () => {
+      const reply = createReply();
+      reply.getHeader.mockReturnValue('application/json; charset=utf-8');
+
+      fastifyAdapter.reply(
+        reply as any,
+        { statusCode: 400, message: 'Oops' },
+        400,
+      );
+
+      expect(reply.header).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      'application/problem+json',
+      'application/vnd.api+json; charset=utf-8',
+      'Application/JSON',
+    ])('should keep the "%s" JSON content type for error bodies', type => {
+      const reply = createReply();
+      reply.getHeader.mockReturnValue(type);
+      const warnSpy = vi.spyOn(Logger, 'warn').mockImplementation(() => {});
+
+      fastifyAdapter.reply(
+        reply as any,
+        { statusCode: 400, message: 'Oops' },
+        400,
+      );
+
+      expect(reply.header).not.toHaveBeenCalled();
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+
+    it('should force a JSON content type for error bodies sent with a non-JSON content type', () => {
+      const reply = createReply();
+      reply.getHeader.mockReturnValue('text/html');
+
+      fastifyAdapter.reply(
+        reply as any,
+        { statusCode: 400, message: 'Oops' },
+        400,
+      );
+
+      expect(reply.header).toHaveBeenCalledWith(
+        'Content-Type',
+        'application/json',
+      );
+    });
   });
 
   describe('mapException', () => {
@@ -83,6 +139,48 @@ describe('FastifyAdapter', () => {
       const error = new Error('Test error');
       const result = fastifyAdapter.mapException(error);
       expect(result).toBe(error);
+    });
+  });
+
+  describe('isHeadersSent', () => {
+    it('should report headers written to the raw response as sent', async () => {
+      let headersSent: Record<string, boolean> | undefined;
+      fastifyAdapter.initHttpServer();
+      fastifyAdapter.get('/p', (_req, reply) => {
+        reply.raw.writeHead(200);
+        headersSent = {
+          reply: fastifyAdapter.isHeadersSent(reply),
+          // Nest middleware receives the raw response instead of the reply.
+          raw: fastifyAdapter.isHeadersSent(reply.raw),
+        };
+        reply.raw.end();
+      });
+
+      await fastifyAdapter.getInstance().ready();
+      await fastifyAdapter.inject({ method: 'GET', url: '/p' });
+
+      expect(headersSent).toEqual({ reply: true, raw: true });
+      await fastifyAdapter.close();
+    });
+  });
+
+  describe('end', () => {
+    it('should end a raw response whose headers were already sent', async () => {
+      fastifyAdapter.initHttpServer();
+      fastifyAdapter.get('/p', (_req, reply) => {
+        reply.raw.writeHead(200);
+        // Nest middleware receives the raw response instead of the reply.
+        fastifyAdapter.end(reply.raw, 'partial');
+      });
+
+      await fastifyAdapter.getInstance().ready();
+      const response = await fastifyAdapter.inject({
+        method: 'GET',
+        url: '/p',
+      });
+
+      expect(response.payload).toBe('partial');
+      await fastifyAdapter.close();
     });
   });
 
@@ -189,6 +287,212 @@ describe('FastifyAdapter', () => {
 
       expect(JSON.parse(res.body).got).toEqual(['a=1', 'b=2', 'c=3']);
       await fastifyAdapter.close();
+    });
+  });
+
+  describe('applyVersionFilter', () => {
+    const registerVersionNeutralRoute = (
+      type: VersioningType.MEDIA_TYPE | VersioningType.HEADER,
+    ) => {
+      fastifyAdapter.initHttpServer();
+      const handler = (_req: FastifyRequest, reply: FastifyReply) =>
+        fastifyAdapter.reply(reply, { ok: true }, 200);
+      const versioningOptions: VersioningOptions =
+        type === VersioningType.MEDIA_TYPE
+          ? { type, key: 'v=' }
+          : { type, header: 'X-API-Version' };
+      const versionedHandler = fastifyAdapter.applyVersionFilter(
+        handler,
+        [VERSION_NEUTRAL, '2'],
+        versioningOptions,
+      );
+      fastifyAdapter.get('/neutral', versionedHandler);
+    };
+
+    afterEach(async () => {
+      await fastifyAdapter.close();
+    });
+
+    it('should serve a version-neutral route when the accept header carries no version (media type versioning)', async () => {
+      registerVersionNeutralRoute(VersioningType.MEDIA_TYPE);
+      await fastifyAdapter.getInstance().ready();
+
+      const res = await fastifyAdapter.inject({
+        method: 'GET',
+        url: '/neutral',
+        headers: { accept: 'application/json' },
+      });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it('should serve a version-neutral route when the accept header is absent (media type versioning)', async () => {
+      registerVersionNeutralRoute(VersioningType.MEDIA_TYPE);
+      await fastifyAdapter.getInstance().ready();
+
+      const res = await fastifyAdapter.inject({
+        method: 'GET',
+        url: '/neutral',
+      });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it('should serve a version-neutral route when the version header is absent (header versioning)', async () => {
+      registerVersionNeutralRoute(VersioningType.HEADER);
+      await fastifyAdapter.getInstance().ready();
+
+      const res = await fastifyAdapter.inject({
+        method: 'GET',
+        url: '/neutral',
+      });
+      expect(res.statusCode).toBe(200);
+    });
+  });
+
+  describe('initHttpServer forceCloseConnections', () => {
+    it('should close after inject() requests and run the onClose hooks', async () => {
+      let onCloseCalled = false;
+      fastifyAdapter.initHttpServer({ forceCloseConnections: true });
+      fastifyAdapter.get('/', () => 'ok');
+      fastifyAdapter.getInstance().addHook('onClose', async () => {
+        onCloseCalled = true;
+      });
+
+      const res = await fastifyAdapter.inject({ method: 'GET', url: '/' });
+      expect(res.statusCode).toBe(200);
+
+      await fastifyAdapter.close();
+      expect(onCloseCalled).toBe(true);
+    });
+  });
+
+  describe('useBodyParser', () => {
+    const registerEchoRoute = () =>
+      fastifyAdapter.post(
+        '/',
+        (req: RawBodyRequest<FastifyRequest>, reply: FastifyReply) =>
+          fastifyAdapter.reply(reply, {
+            body: req.body,
+            rawBody: req.rawBody?.toString(),
+          }),
+      );
+    const post = (contentType: string, payload: string) =>
+      fastifyAdapter.inject({
+        method: 'POST',
+        url: '/',
+        headers: { 'content-type': contentType },
+        payload,
+      });
+
+    afterEach(async () => {
+      await fastifyAdapter.close();
+    });
+
+    it('should keep the default parsers when another content type is registered', async () => {
+      fastifyAdapter.useBodyParser('text/plain', true);
+      fastifyAdapter.registerParserMiddleware(undefined, true);
+      registerEchoRoute();
+
+      const form = await post('application/x-www-form-urlencoded', 'msg=hello');
+      expect(form.statusCode).toBe(200);
+      expect(JSON.parse(form.body)).toEqual({
+        body: { msg: 'hello' },
+        rawBody: 'msg=hello',
+      });
+
+      const json = await post('application/json', '{"msg":"hello"}');
+      expect(JSON.parse(json.body)).toEqual({
+        body: { msg: 'hello' },
+        rawBody: '{"msg":"hello"}',
+      });
+    });
+
+    it.each([
+      ['application/json', '{"msg":"hello"}'],
+      ['application/x-www-form-urlencoded', 'msg=hello'],
+      ['Application/JSON', '{"msg":"hello"}'],
+    ])(
+      'should parse %s with the default parser when no custom parser is given',
+      async (contentType, payload) => {
+        fastifyAdapter.useBodyParser(contentType, true, {
+          bodyLimit: 10_485_760,
+        });
+        // Would throw FST_ERR_CTP_ALREADY_PRESENT if the defaults were registered again.
+        fastifyAdapter.registerParserMiddleware(undefined, true);
+        registerEchoRoute();
+
+        const res = await post(contentType, payload);
+
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body)).toEqual({
+          body: { msg: 'hello' },
+          rawBody: payload,
+        });
+      },
+    );
+
+    it.each([
+      ['a catch-all', '*'],
+      ['a RegExp', /urlencoded/],
+    ])(
+      'should not replace %s custom parser with the default urlencoded one',
+      async (_, type) => {
+        fastifyAdapter.useBodyParser(type, true, {}, (_req, body, done) =>
+          done(null, `custom:${body.toString()}`),
+        );
+        fastifyAdapter.registerParserMiddleware(undefined, true);
+        registerEchoRoute();
+
+        const res = await post(
+          'application/x-www-form-urlencoded',
+          'msg=hello',
+        );
+
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body)).toEqual({
+          body: 'custom:msg=hello',
+          rawBody: 'msg=hello',
+        });
+      },
+    );
+
+    it('should parse each content type of an array with its default parser', async () => {
+      fastifyAdapter.useBodyParser(['application/json', 'text/plain'], true, {
+        bodyLimit: 10_485_760,
+      });
+      fastifyAdapter.registerParserMiddleware(undefined, true);
+      registerEchoRoute();
+
+      const json = await post('application/json', '{"msg":"hello"}');
+      expect(json.statusCode).toBe(200);
+      expect(JSON.parse(json.body)).toEqual({
+        body: { msg: 'hello' },
+        rawBody: '{"msg":"hello"}',
+      });
+
+      const text = await post('text/plain', 'hello');
+      expect(text.statusCode).toBe(200);
+      expect(JSON.parse(text.body).rawBody).toBe('hello');
+    });
+  });
+
+  describe('useStaticAssets / setViewEngine', () => {
+    // `NestApplication` discards what these return, so the plugin has to reach
+    // fastify before the caller's next statement — which in the documented
+    // bootstrap is `listen()`.
+    it('should register @fastify/static before returning', () => {
+      const register = vi.spyOn(fastifyAdapter.getInstance(), 'register');
+
+      fastifyAdapter.useStaticAssets({ root: import.meta.dirname });
+
+      expect(register).toHaveBeenCalledOnce();
+    });
+
+    it('should register @fastify/view before returning', () => {
+      const register = vi.spyOn(fastifyAdapter.getInstance(), 'register');
+
+      fastifyAdapter.setViewEngine({ engine: { handlebars: {} } });
+
+      expect(register).toHaveBeenCalledOnce();
     });
   });
 });

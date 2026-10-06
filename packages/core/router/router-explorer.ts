@@ -80,7 +80,7 @@ export class RouterExplorer {
   ) {
     this.pathsExplorer = new PathsExplorer(metadataScanner);
 
-    const routeParamsFactory = new RouteParamsFactory();
+    const routeParamsFactory = new RouteParamsFactory(config);
     const pipesContextCreator = new PipesContextCreator(container, config);
     const pipesConsumer = new PipesConsumer();
     const guardsContextCreator = new GuardsContextCreator(container, config);
@@ -249,14 +249,18 @@ export class RouterExplorer {
 
           const httpAdapter = this.container.getHttpAdapterRef();
           const onRouteTriggered = httpAdapter.getOnRouteTriggered?.();
+          let handler = routeHandler;
           if (onRouteTriggered) {
-            routerMethodRef(normalizedPath, (...args: unknown[]) => {
+            handler = (...args: unknown[]) => {
               onRouteTriggered(requestMethod, path);
               return routeHandler(...args);
-            });
-          } else {
-            routerMethodRef(normalizedPath, routeHandler);
+            };
           }
+          Object.defineProperty(handler, 'name', {
+            configurable: true,
+            value: `${instanceWrapper.name}.${methodName}`,
+          });
+          routerMethodRef(normalizedPath, handler);
         }
 
         onRouteResolved?.({

@@ -1,5 +1,4 @@
 import type { StandardSchemaV1 } from '@standard-schema/spec';
-import { types } from 'util';
 import { Injectable } from '../decorators/core/injectable.decorator.js';
 import { Optional } from '../decorators/core/optional.decorator.js';
 import { HttpStatus } from '../enums/http-status.enum.js';
@@ -11,12 +10,8 @@ import {
   ErrorHttpStatusCode,
   HttpErrorByCode,
 } from '../utils/http-error-by-code.util.js';
-
-/**
- * Built-in JavaScript types that should be excluded from prototype stripping
- * to avoid conflicts with test frameworks like Jest's useFakeTimers
- */
-const BUILT_IN_TYPES = [Date, RegExp, Error, Map, Set, WeakMap, WeakSet];
+import { isObject } from '../utils/shared.utils.js';
+import { stripProtoKeys } from '../utils/strip-proto-keys.util.js';
 
 /**
  * @publicApi
@@ -106,7 +101,11 @@ export class StandardSchemaValidationPipe implements PipeTransform {
   ): string[] {
     return issues.map(issue => {
       if (issue.path?.length) {
-        return `${issue.path.map(String).join('.')}: ${issue.message}`;
+        const stringPath = issue.path
+          .map(segment => String(isObject(segment) ? segment.key : segment))
+          .join('.');
+
+        return `${stringPath}: ${issue.message}`;
       }
       return issue.message;
     });
@@ -165,43 +164,10 @@ export class StandardSchemaValidationPipe implements PipeTransform {
     options?: Record<string, unknown>,
   ): Promise<StandardSchemaV1.Result<T>> | StandardSchemaV1.Result<T> {
     return schema['~standard'].validate(value, options) as
-      | Promise<StandardSchemaV1.Result<T>>
-      | StandardSchemaV1.Result<T>;
+      Promise<StandardSchemaV1.Result<T>> | StandardSchemaV1.Result<T>;
   }
 
-  /**
-   * Strips dangerous prototype pollution keys from an object.
-   */
-  protected stripProtoKeys(value: any) {
-    if (
-      value == null ||
-      typeof value !== 'object' ||
-      types.isTypedArray(value)
-    ) {
-      return;
-    }
-
-    if (BUILT_IN_TYPES.some(type => value instanceof type)) {
-      return;
-    }
-
-    if (Array.isArray(value)) {
-      for (const v of value) {
-        this.stripProtoKeys(v);
-      }
-      return;
-    }
-
-    delete value.__proto__;
-    delete value.prototype;
-
-    const constructorType = value?.constructor;
-    if (constructorType && !BUILT_IN_TYPES.includes(constructorType)) {
-      delete value.constructor;
-    }
-
-    for (const key in value) {
-      this.stripProtoKeys(value[key]);
-    }
+  protected stripProtoKeys(value: any): void {
+    stripProtoKeys(value);
   }
 }

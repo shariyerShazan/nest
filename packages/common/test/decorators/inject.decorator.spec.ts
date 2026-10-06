@@ -1,4 +1,7 @@
-import { SELF_DECLARED_DEPS_METADATA } from '../../constants.js';
+import {
+  PROPERTY_DEPS_METADATA,
+  SELF_DECLARED_DEPS_METADATA,
+} from '../../constants.js';
 import { Inject } from '../../index.js';
 
 describe('@Inject', () => {
@@ -20,5 +23,48 @@ describe('@Inject', () => {
       { index: 0, param: 'test' },
     ];
     expect(metadata).toEqual(expectedMetadata);
+  });
+
+  describe('when used on a constructor parameter without a token', () => {
+    class Dependency {}
+
+    class TestWithInferredToken {
+      constructor(@Inject() param: Dependency) {}
+    }
+
+    class TestWithUndefinedToken {
+      constructor(@Inject(undefined) param: Dependency) {}
+    }
+
+    it('should infer the token from the parameter type when called without arguments', () => {
+      const metadata = Reflect.getMetadata(
+        SELF_DECLARED_DEPS_METADATA,
+        TestWithInferredToken,
+      );
+      expect(metadata).toEqual([{ index: 0, param: Dependency }]);
+    });
+
+    it('should not infer the token when an explicit undefined token is passed', () => {
+      const metadata = Reflect.getMetadata(
+        SELF_DECLARED_DEPS_METADATA,
+        TestWithUndefinedToken,
+      );
+      expect(metadata).toEqual([{ index: 0, param: undefined }]);
+    });
+  });
+
+  describe('when used on a property redeclared by a subclass', () => {
+    class ParentTest {
+      @Inject('parent') property;
+    }
+
+    class ChildTest extends ParentTest {
+      @Inject('child') override property;
+    }
+
+    it('should replace the inherited token of that property', () => {
+      const metadata = Reflect.getMetadata(PROPERTY_DEPS_METADATA, ChildTest);
+      expect(metadata).toEqual([{ key: 'property', type: 'child' }]);
+    });
   });
 });

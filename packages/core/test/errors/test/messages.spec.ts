@@ -1,6 +1,7 @@
 import { UnknownDependenciesException } from '../../../errors/exceptions/unknown-dependencies.exception.js';
 import {
   INVALID_MODULE_MESSAGE,
+  INVALID_PROVIDER_MESSAGE,
   UNDEFINED_MODULE_MESSAGE,
   UNKNOWN_EXPORT_MESSAGE,
   USING_INVALID_CLASS_AS_A_MODULE_MESSAGE,
@@ -381,6 +382,57 @@ Scope [AppModule -> CatsModule]`);
 
       expect(actualMessage).toBe(expectedMessage);
     });
+
+    it('should display the module name when the parent module is dynamic', () => {
+      const actualMessage = UNDEFINED_MODULE_MESSAGE(
+        { module: CatsModule },
+        0,
+        [AppModule],
+      );
+
+      expect(actualMessage).toContain(
+        'Nest cannot create the CatsModule instance',
+      );
+      expect(actualMessage).toBe(
+        UNDEFINED_MODULE_MESSAGE(CatsModule, 0, [AppModule]),
+      );
+    });
+  });
+
+  describe('INVALID_PROVIDER_MESSAGE', () => {
+    const expectedMessage = (token: string) =>
+      stringCleaner(`Nest cannot create the AppModule instance.
+The provider ${token} in the AppModule "providers" array does not define a valid "useClass", "useValue", "useFactory" or "useExisting" property.
+
+Potential causes:
+- The value of "useClass", "useFactory" or "useExisting" is undefined at runtime, often because of a circular import between files. Check your import statements.
+- None of these properties is set, or the one that is set is null.`);
+
+    it('should display a string token', () => {
+      const actualMessage = stringCleaner(
+        INVALID_PROVIDER_MESSAGE('CATS_SERVICE', 'AppModule'),
+      );
+
+      expect(actualMessage).toBe(expectedMessage('"CATS_SERVICE"'));
+    });
+
+    it('should display a symbol token', () => {
+      const actualMessage = stringCleaner(
+        INVALID_PROVIDER_MESSAGE(Symbol('CATS_SERVICE'), 'AppModule'),
+      );
+
+      expect(actualMessage).toBe(expectedMessage('Symbol(CATS_SERVICE)'));
+    });
+
+    it('should display a class token', () => {
+      class CatsService {}
+
+      const actualMessage = stringCleaner(
+        INVALID_PROVIDER_MESSAGE(CatsService, 'AppModule'),
+      );
+
+      expect(actualMessage).toBe(expectedMessage('CatsService'));
+    });
   });
 
   describe('INVALID_MODULE_MESSAGE', () => {
@@ -442,6 +494,22 @@ Scope [AppModule -> CatsModule]`);
       );
 
       expect(actualMessage).toBe(expectedMessage);
+    });
+
+    it('should display the module name when the parent module is dynamic', () => {
+      const actualMessage = INVALID_MODULE_MESSAGE(
+        { module: CatsModule },
+        0,
+        [AppModule],
+        null,
+      );
+
+      expect(actualMessage).toContain(
+        'Nest cannot create the CatsModule instance',
+      );
+      expect(actualMessage).toBe(
+        INVALID_MODULE_MESSAGE(CatsModule, 0, [AppModule], null),
+      );
     });
   });
 

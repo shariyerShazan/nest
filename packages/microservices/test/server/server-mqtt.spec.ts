@@ -1,3 +1,5 @@
+import { EventEmitter } from 'events';
+import { of } from 'rxjs';
 import { NO_MESSAGE_HANDLER } from '../../constants.js';
 import { BaseRpcContext } from '../../ctx-host/base-rpc.context.js';
 import { MqttContext } from '../../ctx-host/index.js';
@@ -14,13 +16,16 @@ describe('ServerMqtt', () => {
   });
   describe('listen', () => {
     let onSpy: ReturnType<typeof vi.fn>;
+    let onceSpy: ReturnType<typeof vi.fn>;
     let client: any;
     let callbackSpy: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
       onSpy = vi.fn();
+      onceSpy = vi.fn();
       client = {
         on: onSpy,
+        once: onceSpy,
       };
       vi.spyOn(server, 'createMqttClient').mockImplementation(() => client);
       callbackSpy = vi.fn();
@@ -48,6 +53,129 @@ describe('ServerMqtt', () => {
     it('should bind "message" event to handler', async () => {
       await server.listen(callbackSpy);
       expect(onSpy.mock.calls[5][0]).toBe('message');
+    });
+    it('should route "handleMessage" rejections to "handleError" instead of leaving them unhandled', async () => {
+      const error = new Error('unexpected');
+      vi.spyOn(server, 'handleMessage').mockRejectedValue(error);
+      const handleErrorSpy = vi
+        .spyOn(untypedServer, 'handleError')
+        .mockImplementation(() => undefined);
+
+      await server.listen(callbackSpy);
+      const [, onMessage] = onSpy.mock.calls.find(
+        ([event]) => event === 'message',
+      )!;
+      await onMessage('topic', Buffer.from('{}'));
+
+      expect(handleErrorSpy).toHaveBeenCalledWith(error);
+    });
+    it('should bind the callback with "once"', async () => {
+      await server.listen(callbackSpy);
+
+      expect(onceSpy).toHaveBeenCalledWith('connect', expect.any(Function));
+    });
+    it('should run the callback once, as mqtt reconnects on the same client', async () => {
+      // A real emitter, because mqtt re-emits "connect" on the same client
+      // after every reconnect.
+      const emitter: any = new EventEmitter();
+      vi.spyOn(server, 'createMqttClient').mockImplementation(() => emitter);
+
+      await server.listen(callbackSpy);
+      emitter.emit('connect');
+      emitter.emit('connect');
+      emitter.emit('connect');
+
+      expect(callbackSpy).toHaveBeenCalledExactlyOnceWith();
+    });
+    describe('when "maxConnectionAttempts" is configured', () => {
+      let emitter: any;
+      let endSpy: ReturnType<typeof vi.fn>;
+      let serverWithOptions: ServerMqtt;
+      let callbackSpy: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        emitter = new EventEmitter();
+        endSpy = vi.fn();
+        emitter.end = endSpy;
+        serverWithOptions = new ServerMqtt({
+          maxConnectionAttempts: 2,
+        } as any);
+        vi.spyOn(serverWithOptions, 'createMqttClient').mockImplementation(
+          () => emitter,
+        );
+        callbackSpy = vi.fn();
+      });
+
+      it('should not call the callback when the error limit is not reached', async () => {
+        await serverWithOptions.listen(callbackSpy);
+        emitter.emit('error', new Error('first failure'));
+
+        expect(callbackSpy).not.toHaveBeenCalled();
+        expect(endSpy).not.toHaveBeenCalled();
+      });
+
+      it('should close the client and report the failure once the limit is reached', async () => {
+        const error = new Error('second failure');
+
+        await serverWithOptions.listen(callbackSpy);
+        emitter.emit('error', new Error('first failure'));
+        emitter.emit('error', error);
+
+        expect(endSpy).toHaveBeenCalledOnce();
+        expect(callbackSpy).toHaveBeenCalledExactlyOnceWith(error);
+      });
+
+      it('should not call the callback twice when the connection succeeds first', async () => {
+        await serverWithOptions.listen(callbackSpy);
+        emitter.emit('connect');
+        emitter.emit('error', new Error('post-connect failure'));
+        emitter.emit('error', new Error('post-connect failure'));
+
+        expect(callbackSpy).toHaveBeenCalledExactlyOnceWith();
+      });
+
+      it('should not close the client when errors occur after a successful connection', async () => {
+        await serverWithOptions.listen(callbackSpy);
+        emitter.emit('connect');
+        emitter.emit('error', new Error('first runtime failure'));
+        emitter.emit('error', new Error('second runtime failure'));
+        emitter.emit('error', new Error('third runtime failure'));
+
+        expect(endSpy).not.toHaveBeenCalled();
+      });
+
+      it('should apply the limit again when the server is restarted', async () => {
+        await serverWithOptions.listen(callbackSpy);
+        emitter.emit('connect');
+        serverWithOptions.close();
+
+        const restartEmitter: any = new EventEmitter();
+        restartEmitter.end = vi.fn();
+        vi.spyOn(serverWithOptions, 'createMqttClient').mockImplementation(
+          () => restartEmitter,
+        );
+        const restartCallbackSpy = vi.fn();
+
+        await serverWithOptions.listen(restartCallbackSpy);
+        restartEmitter.emit('error', new Error('first failure'));
+        restartEmitter.emit('error', new Error('second failure'));
+
+        expect(restartEmitter.end).toHaveBeenCalledOnce();
+        expect(restartCallbackSpy).toHaveBeenCalledOnce();
+      });
+
+      it('should keep retrying when maxConnectionAttempts is not set', async () => {
+        const serverWithoutLimit = new ServerMqtt({} as any);
+        vi.spyOn(serverWithoutLimit, 'createMqttClient').mockImplementation(
+          () => emitter,
+        );
+
+        await serverWithoutLimit.listen(callbackSpy);
+        emitter.emit('error', new Error('failure'));
+
+        expect(callbackSpy).not.toHaveBeenCalled();
+        expect(endSpy).not.toHaveBeenCalled();
+      });
     });
     describe('when "start" throws an exception', () => {
       it('should call callback with a thrown error as an argument', async () => {
@@ -196,7 +324,7 @@ describe('ServerMqtt', () => {
       it('should call "handleMessage"', async () => {
         const handleMessageStub = vi
           .spyOn(server, 'handleMessage')
-          .mockImplementation(() => null!);
+          .mockResolvedValue(undefined as any);
         await server.getMessageHandler(untypedServer.mqttClient)(
           null!,
           null!,
@@ -252,6 +380,54 @@ describe('ServerMqtt', () => {
         null,
       );
       expect(handler).toHaveBeenCalledWith(data, expect.any(MqttContext));
+    });
+  });
+
+  describe('processing end hook', () => {
+    const channel = 'test';
+    const id = '3';
+    let publishSpy: ReturnType<typeof vi.fn>;
+    let endHook: ReturnType<typeof vi.fn>;
+
+    const bindHandler = (handler: () => unknown) => {
+      publishSpy = vi.fn();
+      vi.spyOn(server, 'getPublisher').mockImplementation(() => publishSpy);
+      endHook = vi.fn();
+      untypedServer.onProcessingStartHook = (
+        _transportId: unknown,
+        _ctx: unknown,
+        fn: () => Promise<void>,
+      ) => fn();
+      untypedServer.onProcessingEndHook = endHook;
+      untypedServer.messageHandlers = objectToMap({
+        [channel]: (async () => handler()) as any,
+      });
+    };
+    const handleMessage = () =>
+      server.handleMessage(
+        channel,
+        Buffer.from(JSON.stringify({ id, pattern: channel, data: 'test' })),
+        null!,
+      );
+    const flush = () => new Promise(resolve => setImmediate(resolve));
+
+    it('should run the hook once when the response stream emits several values', async () => {
+      bindHandler(() => of('first', 'second', 'third'));
+
+      await handleMessage();
+      await flush();
+
+      expect(publishSpy).toHaveBeenCalledTimes(3);
+      expect(endHook).toHaveBeenCalledOnce();
+    });
+    it('should run the hook when the handler rejects', async () => {
+      bindHandler(() => {
+        throw new Error('handler failed');
+      });
+
+      await expect(handleMessage()).rejects.toThrow('handler failed');
+
+      expect(endHook).toHaveBeenCalledOnce();
     });
   });
   describe('getPublisher', () => {

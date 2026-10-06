@@ -1,6 +1,11 @@
-import { BadRequestException } from '@nestjs/common';
+import {
+  BadRequestException,
+  RequestMethod,
+  StreamableFile,
+} from '@nestjs/common';
 import { ExpressAdapter } from '@nestjs/platform-express';
 import express from 'express';
+import { PassThrough } from 'stream';
 
 describe('ExpressAdapter', () => {
   afterEach(() => vi.restoreAllMocks());
@@ -8,6 +13,138 @@ describe('ExpressAdapter', () => {
 
   beforeEach(() => {
     expressAdapter = new ExpressAdapter();
+  });
+
+  describe('setErrorHandler', () => {
+    it.each([
+      { prefix: 'api', path: '/api' },
+      { prefix: '/api', path: '/api' },
+      { prefix: 'api/', path: '/api' },
+      { prefix: '/api/', path: '/api' },
+      { prefix: 'api/v1/', path: '/api/v1' },
+    ])(
+      'should mount the error handler at $path and the root for prefix $prefix',
+      ({ prefix, path }) => {
+        const expressInstance = expressAdapter.getInstance();
+        const useSpy = vi.spyOn(expressInstance, 'use');
+        const handler = vi.fn();
+
+        expressAdapter.setErrorHandler(handler, prefix);
+
+        expect(useSpy).toHaveBeenCalledTimes(2);
+        expect(useSpy).toHaveBeenCalledWith(path, expect.any(Function));
+        expect(useSpy).toHaveBeenCalledWith(handler);
+      },
+    );
+
+    it.each([undefined, '', '/'])(
+      'should mount only the root error handler for prefix %j',
+      prefix => {
+        const useSpy = vi.spyOn(expressAdapter.getInstance(), 'use');
+        const handler = vi.fn();
+
+        expressAdapter.setErrorHandler(handler, prefix);
+
+        expect(useSpy).toHaveBeenCalledExactlyOnceWith(handler);
+      },
+    );
+  });
+
+  describe('setNotFoundHandler', () => {
+    it.each([
+      { prefix: 'api', path: '/api' },
+      { prefix: '/api', path: '/api' },
+      { prefix: 'api/', path: '/api' },
+      { prefix: '/api/', path: '/api' },
+      { prefix: 'api/v1/', path: '/api/v1' },
+    ])(
+      'should mount the not-found handler at $path for prefix $prefix',
+      ({ prefix, path }) => {
+        const expressInstance = expressAdapter.getInstance();
+        const useSpy = vi.spyOn(expressInstance, 'use');
+
+        expressAdapter.setNotFoundHandler(vi.fn(), prefix);
+
+        expect(useSpy).toHaveBeenCalledExactlyOnceWith(
+          path,
+          expect.any(Function),
+        );
+      },
+    );
+
+    it.each([undefined, '', '/'])(
+      'should mount only the root not-found handler for prefix %j',
+      prefix => {
+        const useSpy = vi.spyOn(expressAdapter.getInstance(), 'use');
+
+        expressAdapter.setNotFoundHandler(vi.fn(), prefix);
+
+        expect(useSpy).toHaveBeenCalledExactlyOnceWith(expect.any(Function));
+      },
+    );
+  });
+
+  describe('createMiddlewareFactory', () => {
+    // Plain-path routes such as forRoutes('*') carry no request method
+    // (see RoutesMapper.getRouteInfoFromPath).
+    const NO_REQUEST_METHOD = -1 as RequestMethod;
+
+    it.each([
+      {
+        method: NO_REQUEST_METHOD,
+        path: '/api$',
+        expressMethod: 'all',
+        registeredPath: '/api',
+      },
+      {
+        method: NO_REQUEST_METHOD,
+        path: '/api/v1$',
+        expressMethod: 'all',
+        registeredPath: '/api/v1',
+      },
+      {
+        method: RequestMethod.GET,
+        path: '/api$',
+        expressMethod: 'get',
+        registeredPath: '/api',
+      },
+    ] as const)(
+      'should register the exact-match path $path through "$expressMethod" at $registeredPath',
+      ({ method, path, expressMethod, registeredPath }) => {
+        const expressInstance = expressAdapter.getInstance();
+        const routeSpy = vi.spyOn(expressInstance, expressMethod);
+        const useSpy = vi.spyOn(expressInstance, 'use');
+        const handler = vi.fn();
+
+        expressAdapter.createMiddlewareFactory(method)(path, handler);
+
+        expect(routeSpy).toHaveBeenCalledExactlyOnceWith(
+          registeredPath,
+          expect.any(Function),
+        );
+        expect(useSpy).not.toHaveBeenCalled();
+      },
+    );
+
+    it('should leave "/api/" of the exact-match path to the wildcard entry', () => {
+      const allSpy = vi.spyOn(expressAdapter.getInstance(), 'all');
+      const middleware = vi.fn();
+      const next = vi.fn();
+
+      expressAdapter.createMiddlewareFactory(NO_REQUEST_METHOD)(
+        '/api$',
+        middleware,
+      );
+      const [, handler] = allSpy.mock.calls[0] as unknown as [string, Function];
+
+      handler({ path: '/api/' }, {}, next);
+      expect(middleware).not.toHaveBeenCalled();
+      expect(next).toHaveBeenCalledOnce();
+
+      const req = { path: '/api' };
+      handler(req, {}, next);
+      expect(middleware).toHaveBeenCalledExactlyOnceWith(req, {}, next);
+    });
   });
 
   describe('registerParserMiddleware', () => {
@@ -85,6 +222,104 @@ describe('ExpressAdapter', () => {
 
         expect(response.status).toHaveBeenCalledWith(statusCode);
       }
+    });
+
+    it.each([
+      'application/json; charset=utf-8',
+      'application/problem+json',
+      'application/vnd.api+json; charset=utf-8',
+      'Application/JSON',
+    ])('should keep the "%s" JSON content type for error bodies', type => {
+      const response = createResponse();
+      response.getHeader.mockReturnValue(type);
+      const warnSpy = vi
+        .spyOn((expressAdapter as any).logger, 'warn')
+        .mockImplementation(() => {});
+
+      expressAdapter.reply(response, { statusCode: 400, message: 'Oops' }, 400);
+
+      expect(response.setHeader).not.toHaveBeenCalled();
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(response.json).toHaveBeenCalled();
+    });
+
+    it('should force a JSON content type for error bodies sent with a non-JSON content type', () => {
+      const response = createResponse();
+      response.getHeader.mockReturnValue('text/html');
+
+      expressAdapter.reply(response, { statusCode: 400, message: 'Oops' }, 400);
+
+      expect(response.setHeader).toHaveBeenCalledWith(
+        'Content-Type',
+        'application/json',
+      );
+    });
+
+    describe('when the body is a StreamableFile', () => {
+      const createStreamResponse = () =>
+        Object.assign(new PassThrough(), {
+          getHeader: vi.fn(),
+          setHeader: vi.fn(),
+        });
+
+      it('should destroy the source stream when the client disconnects', async () => {
+        const source = new PassThrough();
+        const errorHandler = vi.fn();
+        const errorLogger = vi.fn();
+        const file = new StreamableFile(source)
+          .setErrorHandler(errorHandler)
+          .setErrorLogger(errorLogger);
+        const response = createStreamResponse();
+
+        expressAdapter.reply(response, file);
+        source.write('partial');
+        response.destroy();
+
+        await vi.waitFor(() => expect(source.destroyed).toBe(true));
+        expect(errorHandler).not.toHaveBeenCalled();
+        expect(errorLogger).not.toHaveBeenCalled();
+      });
+
+      it('should destroy the source stream when the client disconnected before the reply', async () => {
+        const source = new PassThrough();
+        const response = createStreamResponse();
+        response.destroy();
+        await new Promise(resolve => setImmediate(resolve));
+
+        expressAdapter.reply(response, new StreamableFile(source));
+
+        await vi.waitFor(() => expect(source.destroyed).toBe(true));
+      });
+
+      it('should not destroy a source that has ended', async () => {
+        const source = new PassThrough({ autoDestroy: false });
+        const response = createStreamResponse();
+        response.resume();
+
+        expressAdapter.reply(response, new StreamableFile(source));
+        source.end('done');
+        await new Promise(resolve => response.once('end', resolve));
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(source.readableEnded).toBe(true);
+        expect(source.destroyed).toBe(false);
+      });
+
+      it('should keep the source open while the response is being written', async () => {
+        const source = new PassThrough();
+        const response = createStreamResponse();
+        const chunks: Buffer[] = [];
+        response.on('data', chunk => chunks.push(chunk));
+
+        expressAdapter.reply(response, new StreamableFile(source));
+        source.write('first');
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(source.destroyed).toBe(false);
+        source.end('second');
+        await new Promise(resolve => response.once('end', resolve));
+        expect(Buffer.concat(chunks).toString()).toBe('firstsecond');
+      });
     });
   });
 

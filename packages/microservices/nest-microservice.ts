@@ -279,6 +279,9 @@ export class NestMicroservice
     await this.loadSocketModule();
     await super.init();
     await this.registerModules();
+    if (this.microserviceConfig?.autoFlushLogs ?? true) {
+      this.flushLogs();
+    }
     return this;
   }
 
@@ -313,6 +316,13 @@ export class NestMicroservice
   public async close(): Promise<any> {
     await this.serverInstance.close();
     if (this.isTerminated) {
+      // A hybrid application flags every connected microservice as terminated
+      // before closing it, because the parent owns the shared container and
+      // runs the lifecycle hooks itself - running them here as well would
+      // execute the whole chain twice. The process signal listeners this
+      // instance registered on its own are not shared, though, so they still
+      // have to be detached here; nothing else holds a reference to them.
+      this.unsubscribeFromProcessSignals();
       return;
     }
     this.setIsTerminated(true);

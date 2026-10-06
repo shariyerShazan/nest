@@ -3,7 +3,6 @@ import * as net from 'net';
 import { Server as NetSocket, Socket } from 'net';
 import { createServer as tlsCreateServer, TlsOptions } from 'tls';
 import {
-  EADDRINUSE,
   ECONNREFUSED,
   NO_MESSAGE_HANDLER,
   TCP_DEFAULT_HOST,
@@ -25,7 +24,7 @@ import {
   TransportId,
 } from '../interfaces/microservice-configuration.interface.js';
 import { Server } from './server.js';
-import { isString, isUndefined } from '@nestjs/common/internal';
+import { isUndefined } from '@nestjs/common/internal';
 
 /**
  * @publicApi
@@ -38,13 +37,23 @@ export class ServerTCP extends Server<TcpEvents, TcpStatus> {
   protected readonly host: string;
   protected readonly socketClass: Type<TcpSocket>;
   protected readonly maxBufferSize?: number;
+  protected readonly incompleteMessageTimeout?: number;
+  protected readonly maxSendBufferSize?: number;
   protected isManuallyTerminated = false;
   protected retryAttemptsCount = 0;
+  protected retryTimer?: ReturnType<typeof setTimeout>;
   protected tlsOptions?: TlsOptions;
   protected pendingEventListeners: Array<{
     event: keyof TcpEvents;
     callback: TcpEvents[keyof TcpEvents];
   }> = [];
+  /**
+   * Sockets accepted by this server that are still open. "net.Server#close"
+   * only stops the server from accepting new connections, so these are tracked
+   * separately and torn down on "close" - otherwise the process outlives the
+   * shutdown and handlers keep running on already established connections.
+   */
+  protected readonly openSockets = new Set<Socket>();
 
   constructor(private readonly options: Required<TcpOptions>['options']) {
     super();
@@ -53,6 +62,11 @@ export class ServerTCP extends Server<TcpEvents, TcpStatus> {
     this.socketClass = this.getOptionsProp(options, 'socketClass', JsonSocket);
     this.tlsOptions = this.getOptionsProp(options, 'tlsOptions');
     this.maxBufferSize = this.getOptionsProp(options, 'maxBufferSize');
+    this.incompleteMessageTimeout = this.getOptionsProp(
+      options,
+      'incompleteMessageTimeout',
+    );
+    this.maxSendBufferSize = this.getOptionsProp(options, 'maxSendBufferSize');
 
     this.init();
     this.initializeSerializer(options);
@@ -62,27 +76,45 @@ export class ServerTCP extends Server<TcpEvents, TcpStatus> {
   public listen(
     callback: (err?: unknown, ...optionalParams: unknown[]) => void,
   ) {
-    this.server.once(TcpEventsMap.ERROR, (err: Record<string, unknown>) => {
-      if (err?.code === EADDRINUSE || err?.code === ECONNREFUSED) {
-        this._status$.next(TcpStatus.DISCONNECTED);
+    // The once('error') listener outlives a successful listen, so a later
+    // error must find the callback already settled.
+    let listenCallback:
+      ((err?: unknown, ...optionalParams: unknown[]) => void) | undefined =
+      callback;
+    const settleListenCallback = (err?: unknown) => {
+      const cb = listenCallback;
+      listenCallback = undefined;
+      isUndefined(err) ? cb?.() : cb?.(err);
+    };
 
-        return callback(err);
+    this.server.once(TcpEventsMap.ERROR, err => {
+      if (!listenCallback) {
+        return;
       }
+      this._status$.next(TcpStatus.DISCONNECTED);
+      settleListenCallback(err);
     });
-    this.server.listen(this.port, this.host, callback as () => void);
+    this.server.listen(this.port, this.host, () => settleListenCallback());
   }
 
   public close() {
     this.isManuallyTerminated = true;
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+    }
 
     this.server.close();
+    this.closeOpenSockets();
     this.pendingEventListeners = [];
   }
 
   public bindHandler(socket: Socket) {
+    this.trackOpenSocket(socket);
+
     const readSocket = this.getSocketInstance(socket);
-    readSocket.on('message', async (msg: ReadPacket & PacketId) =>
-      this.handleMessage(readSocket, msg),
+    readSocket.on('message', (msg: ReadPacket & PacketId) =>
+      this.handleMessage(readSocket, msg).catch(err => this.handleError(err)),
     );
     readSocket.on(TcpEventsMap.ERROR, err => {
       const invalidError = new InvalidTcpDataReceptionException(err);
@@ -92,11 +124,9 @@ export class ServerTCP extends Server<TcpEvents, TcpStatus> {
 
   public async handleMessage(socket: TcpSocket, rawMessage: unknown) {
     const packet = await this.deserializer.deserialize(rawMessage);
-    const pattern = !isString(packet.pattern)
-      ? JSON.stringify(packet.pattern)
-      : packet.pattern;
+    const pattern = this.getPatternAsString(packet.pattern);
 
-    const tcpContext = new TcpContext([socket, pattern]);
+    const tcpContext = new TcpContext([socket, pattern, packet.metadata]);
     if (isUndefined((packet as IncomingRequest).id)) {
       return this.handleEvent(pattern, packet, tcpContext);
     }
@@ -111,29 +141,25 @@ export class ServerTCP extends Server<TcpEvents, TcpStatus> {
       });
       return socket.sendMessage(noHandlerPacket);
     }
-    return this.onProcessingStartHook(
-      this.transportId,
+    return this.handleRequest(
       tcpContext,
-      async () => {
-        const response$ = this.transformToObservable(
-          await handler(packet.data, tcpContext),
+      async () =>
+        this.transformToObservable(await handler(packet.data, tcpContext)),
+      data => {
+        Object.assign(data, { id: (packet as IncomingRequest).id });
+        const outgoingResponse = this.serializer.serialize(
+          data as WritePacket & PacketId,
         );
 
-        response$ &&
-          this.send(response$, data => {
-            Object.assign(data, { id: (packet as IncomingRequest).id });
-            const outgoingResponse = this.serializer.serialize(
-              data as WritePacket & PacketId,
-            );
-
-            this.onProcessingEndHook?.(this.transportId, tcpContext);
-            socket.sendMessage(outgoingResponse);
-          });
+        socket.sendMessage(outgoingResponse);
       },
     );
   }
 
   public handleClose(): undefined | number | NodeJS.Timer {
+    if (this.retryTimer) {
+      return this.retryTimer;
+    }
     if (
       this.isManuallyTerminated ||
       !this.getOptionsProp(this.options, 'retryAttempts') ||
@@ -143,10 +169,16 @@ export class ServerTCP extends Server<TcpEvents, TcpStatus> {
       return undefined;
     }
     ++this.retryAttemptsCount;
-    return setTimeout(
-      () => this.server.listen(this.port, this.host),
+    this.retryTimer = setTimeout(
+      () => {
+        this.retryTimer = undefined;
+        if (!this.isManuallyTerminated) {
+          this.server.listen(this.port, this.host);
+        }
+      },
       this.getOptionsProp(this.options, 'retryDelay', 0),
     );
+    return this.retryTimer;
   }
 
   public unwrap<T>(): T {
@@ -212,12 +244,41 @@ export class ServerTCP extends Server<TcpEvents, TcpStatus> {
     });
   }
 
+  /**
+   * Keeps a reference to an accepted socket so that it can be destroyed when
+   * the server is closed, and drops it again once it closes on its own.
+   */
+  protected trackOpenSocket(socket: Socket) {
+    if (!socket) {
+      return;
+    }
+    this.openSockets.add(socket);
+    socket.on(TcpEventsMap.CLOSE, () => this.openSockets.delete(socket));
+  }
+
+  /**
+   * Destroys every socket still open. Called on shutdown so that "close" does
+   * not leave the process alive, and so that no further messages are dispatched
+   * to handlers over connections established before the shutdown.
+   */
+  protected closeOpenSockets() {
+    this.openSockets.forEach(socket => socket.destroy());
+    this.openSockets.clear();
+  }
+
   protected getSocketInstance(socket: Socket): TcpSocket {
-    // Pass maxBufferSize only if socketClass is JsonSocket
-    // For custom socket classes, users should handle maxBufferSize in their own implementation
-    if (this.maxBufferSize !== undefined && this.socketClass === JsonSocket) {
+    // Pass the framing options only if socketClass is JsonSocket
+    // For custom socket classes, users should handle them in their own implementation
+    const hasJsonSocketOptions =
+      this.maxBufferSize !== undefined ||
+      this.incompleteMessageTimeout !== undefined ||
+      this.maxSendBufferSize !== undefined;
+
+    if (hasJsonSocketOptions && this.socketClass === JsonSocket) {
       return new this.socketClass(socket, {
         maxBufferSize: this.maxBufferSize,
+        incompleteMessageTimeout: this.incompleteMessageTimeout,
+        maxSendBufferSize: this.maxSendBufferSize,
       });
     }
     return new this.socketClass(socket);

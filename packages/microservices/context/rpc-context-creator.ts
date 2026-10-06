@@ -26,7 +26,7 @@ import {
   type PipesContextCreator,
   STATIC_CONTEXT,
 } from '@nestjs/core/internal';
-import { defer, from, mergeMap, Observable } from 'rxjs';
+import { defer, Observable } from 'rxjs';
 import { PARAM_ARGS_METADATA } from '../constants.js';
 import { RpcException } from '../exceptions/index.js';
 import { RpcParamsFactory } from '../factories/rpc-params-factory.js';
@@ -67,6 +67,7 @@ export class RpcContextCreator {
     contextId = STATIC_CONTEXT,
     inquirerId?: string,
     defaultCallMetadata: Record<string, any> = DEFAULT_CALLBACK_METADATA,
+    reportUnhandledErrors = false,
   ): (...args: any[]) => Promise<Observable<any>> {
     const contextType: ContextType = 'rpc';
     const { argsLength, paramtypes, getParamsMetadata } = this.getMetadata<T>(
@@ -129,7 +130,7 @@ export class RpcContextCreator {
     const preRequestHooks =
       this.applicationConfig?.getGlobalPreRequestHooks() ?? [];
 
-    return this.rpcProxy.create(async (...args: unknown[]) => {
+    const targetCallback = async (...args: unknown[]) => {
       const initialArgs = this.contextUtils.createNullArray(argsLength);
 
       const executePipeline = async () => {
@@ -155,8 +156,13 @@ export class RpcContextCreator {
       );
       executionContext.setType(contextType);
 
+      // With no interceptors registered, `InterceptorsConsumer#intercept`
+      // resolves to whatever the handler returned rather than to an observable,
+      // so the result has to be wrapped rather than merged.
+      // `InterceptorsConsumer#transformDeferred` does exactly that, and also
+      // skips subscribing the producer once the consumer has unsubscribed.
       const pipelineObs: Observable<unknown> = defer(() =>
-        from(executePipeline()).pipe(mergeMap(obs => obs)),
+        this.interceptorsConsumer.transformDeferred(executePipeline),
       );
 
       let index = 0;
@@ -166,7 +172,12 @@ export class RpcContextCreator {
       };
 
       return next();
-    }, exceptionHandler);
+    };
+    return this.rpcProxy.create(
+      targetCallback,
+      exceptionHandler,
+      reportUnhandledErrors,
+    );
   }
 
   public reflectCallbackParamtypes(

@@ -50,6 +50,16 @@ import { Logger } from '@nestjs/common';
 import { loadPackage, isNil, isUndefined } from '@nestjs/common/internal';
 
 /**
+ * The consumer and producer created by a single `connect()` attempt, kept so a
+ * failed attempt can disconnect its own instances even after a newer attempt
+ * has replaced them on the client.
+ */
+interface KafkaConnectionAttempt {
+  consumer?: Consumer;
+  producer?: Producer;
+}
+
+/**
  * @publicApi
  */
 export class ClientKafka
@@ -126,6 +136,7 @@ export class ClientKafka
   }
 
   public async close(): Promise<void> {
+    this.handleClose();
     this._producer && (await this._producer.disconnect());
     this._consumer && (await this._consumer.disconnect());
     this._producer = null;
@@ -134,15 +145,68 @@ export class ClientKafka
     this.client = null;
   }
 
+  public handleClose() {
+    if (this.routingMap.size > 0) {
+      const err = new Error('Connection closed');
+      const callbacks = [...this.routingMap.values()];
+      this.routingMap.clear();
+
+      for (const callback of callbacks) {
+        try {
+          callback({ err });
+        } catch (callbackErr) {
+          // A failing callback must not keep the remaining requests pending
+          // nor prevent the connection from being closed.
+          this.logger.error(callbackErr);
+        }
+      }
+    }
+  }
+
   public async connect(): Promise<Producer> {
     if (this.initialized) {
       return this.initialized.then(() => this._producer!);
     }
-    this.initialized = this.initializeClientAndConnections();
-    return this.initialized.then(() => this._producer!);
+    const attempt: KafkaConnectionAttempt = {};
+    const initialized = this.initializeClientAndConnections(attempt).catch(
+      async err => {
+        // A rejected attempt must not be cached: the next `connect()` call
+        // has to try again once the broker is reachable, instead of failing
+        // forever with the error of the first attempt.
+        await this.discardPartialConnection(attempt, initialized);
+        throw err;
+      },
+    );
+    this.initialized = initialized;
+    return initialized.then(() => this._producer!);
   }
 
-  private async initializeClientAndConnections(): Promise<void> {
+  /**
+   * Tears down whatever a failed connection attempt managed to create, so a
+   * consumer that joined its group before the producer failed does not stay
+   * behind when the next attempt creates a new one. The client's state is only
+   * reset if no newer attempt has replaced it in the meantime (e.g., `close()`
+   * followed by `connect()` while the failed attempt was still pending).
+   */
+  private async discardPartialConnection(
+    attempt: KafkaConnectionAttempt,
+    initialized: Promise<void>,
+  ): Promise<void> {
+    if (this.initialized === initialized) {
+      this._consumer = null;
+      this._producer = null;
+      this.client = null;
+      this.initialized = null;
+    }
+    await Promise.allSettled([
+      attempt.consumer?.disconnect(),
+      attempt.producer?.disconnect(),
+    ]);
+  }
+
+  private async initializeClientAndConnections(
+    attempt: KafkaConnectionAttempt,
+  ): Promise<void> {
     this.client = await this.createClient();
     if (!this.producerOnlyMode) {
       const partitionAssigners = [
@@ -157,7 +221,8 @@ export class ClientKafka
         groupId: this.groupId,
       };
 
-      this._consumer = this.client!.consumer(consumerOptions);
+      this._consumer = attempt.consumer =
+        this.client!.consumer(consumerOptions);
       this.registerConsumerEventListeners();
 
       // Set member assignments on join and rebalance
@@ -169,7 +234,9 @@ export class ClientKafka
       await this.bindTopics();
     }
 
-    this._producer = this.client!.producer(this.options.producer || {});
+    this._producer = attempt.producer = this.client!.producer(
+      this.options.producer || {},
+    );
     this.registerProducerEventListeners();
     await this._producer.connect();
   }

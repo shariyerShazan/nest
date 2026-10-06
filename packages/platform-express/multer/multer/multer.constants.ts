@@ -6,9 +6,14 @@ export const multerExceptions = {
   LIMIT_FIELD_KEY: 'Field name too long',
   LIMIT_FIELD_VALUE: 'Field value too long',
   LIMIT_FIELD_COUNT: 'Too many fields',
-  LIMIT_UNEXPECTED_FILE: 'Unexpected field',
+  LIMIT_UNEXPECTED_FILE: 'Unexpected file field',
   MISSING_FIELD_NAME: 'Field name missing',
   LIMIT_FIELD_NESTING: 'Field name nesting too deep',
+  LIMIT_FIELD_ARRAY_INDEX: 'Field name array index too large',
+  INVALID_FIELD_NAME: 'Invalid field name',
+  // STREAM_DESTROYED is left out on purpose: it is raised by the storage
+  // engine after the file stream was destroyed, not by the request, so it
+  // stays a 500.
 };
 
 export const busboyExceptions = {

@@ -14,11 +14,33 @@ import { isNil, isString } from '../utils/shared.utils.js';
 /**
  * @publicApi
  */
+export type UUIDVersion =
+  | '1'
+  | '2'
+  | '3'
+  | '4'
+  | '5'
+  | '6'
+  | '7'
+  | '8'
+  | 1
+  | 2
+  | 3
+  | 4
+  | 5
+  | 6
+  | 7
+  | 8
+  | 'all';
+
+/**
+ * @publicApi
+ */
 export interface ParseUUIDPipeOptions {
   /**
    * UUID version to validate
    */
-  version?: '3' | '4' | '5' | '7';
+  version?: UUIDVersion;
   /**
    * The HTTP status code to be used in the response when the validation fails.
    */
@@ -46,14 +68,19 @@ export interface ParseUUIDPipeOptions {
  */
 @Injectable()
 export class ParseUUIDPipe implements PipeTransform {
-  protected static uuidRegExps = {
-    3: /^[0-9A-F]{8}-[0-9A-F]{4}-3[0-9A-F]{3}-[0-9A-F]{4}-[0-9A-F]{12}$/i,
+  protected static uuidRegExps: Record<UUIDVersion, RegExp> = {
+    1: /^[0-9A-F]{8}-[0-9A-F]{4}-1[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    2: /^[0-9A-F]{8}-[0-9A-F]{4}-2[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    3: /^[0-9A-F]{8}-[0-9A-F]{4}-3[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
     4: /^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
     5: /^[0-9A-F]{8}-[0-9A-F]{4}-5[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    6: /^[0-9A-F]{8}-[0-9A-F]{4}-6[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
     7: /^[0-9A-F]{8}-[0-9A-F]{4}-7[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
-    all: /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i,
+    8: /^[0-9A-F]{8}-[0-9A-F]{4}-8[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+    // Versions 1-8 with the RFC variant, or the Nil and Max UUIDs (RFC 9562, sections 5.9, 5.10)
+    all: /^(?:[0-9A-F]{8}-[0-9A-F]{4}-[1-8][0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}|00000000-0000-0000-0000-000000000000|FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF)$/i,
   };
-  private readonly version: '3' | '4' | '5' | '7' | undefined;
+  private readonly version: ParseUUIDPipeOptions['version'];
   protected exceptionFactory: (errors: string) => any;
 
   constructor(@Optional() protected readonly options?: ParseUUIDPipeOptions) {
@@ -80,14 +107,14 @@ export class ParseUUIDPipe implements PipeTransform {
     if (!this.isUUID(value, this.version)) {
       throw this.exceptionFactory(
         `Validation failed (uuid${
-          this.version ? ` v ${this.version}` : ''
+          this.version && this.version !== 'all' ? ` v ${this.version}` : ''
         } is expected)`,
       );
     }
     return value as string;
   }
 
-  protected isUUID(str: unknown, version = 'all') {
+  protected isUUID(str: unknown, version: UUIDVersion = 'all') {
     if (!isString(str)) {
       throw this.exceptionFactory('The value passed as UUID is not a string');
     }

@@ -11,6 +11,7 @@ import {
   NatsStatus,
 } from '../events/nats.events.js';
 import {
+  IncomingResponse,
   NatsOptions,
   PacketId,
   ReadPacket,
@@ -57,22 +58,63 @@ export class ClientNats extends ClientProxy<NatsEvents, NatsStatus> {
   }
 
   public async close() {
-    await this.natsClient?.close();
-    this.statusEventEmitter.removeAllListeners();
+    this.handleClose();
+    try {
+      await this.natsClient?.close();
+    } finally {
+      this.statusEventEmitter.removeAllListeners();
 
-    this.natsClient = null;
-    this.connectionPromise = null;
+      this.natsClient = null;
+      this.connectionPromise = null;
+    }
+  }
+
+  public handleClose() {
+    if (this.routingMap.size > 0) {
+      const err = new Error('Connection closed');
+      const callbacks = [...this.routingMap.values()];
+      this.routingMap.clear();
+
+      for (const callback of callbacks) {
+        try {
+          callback({ err });
+        } catch (callbackErr) {
+          // A failing callback must not keep the remaining requests pending
+          // nor prevent the connection from being closed.
+          this.logger.error(callbackErr);
+        }
+      }
+    }
   }
 
   public async connect(): Promise<any> {
     if (this.connectionPromise) {
       return this.connectionPromise;
     }
-    this.connectionPromise = this.createClient();
-    this.natsClient = await this.connectionPromise.catch(err => {
-      this.connectionPromise = null;
+    const connectionPromise = this.createClient();
+    this.connectionPromise = connectionPromise;
+    const natsClient = await connectionPromise.catch(err => {
+      // A rejected attempt must not be cached, but a newer attempt may have
+      // replaced it in the meantime (close() followed by connect() while this
+      // attempt was still pending): only reset the shared state when the
+      // failing attempt is still the current one, as ClientRedis, ClientRMQ
+      // and ClientKafka already do.
+      if (this.connectionPromise === connectionPromise) {
+        this.connectionPromise = null;
+      }
       throw err;
     });
+    if (this.connectionPromise !== connectionPromise) {
+      // The client was closed (and possibly reconnected) while this attempt
+      // was still pending: the connection it opened is no longer tracked by
+      // the client, so it must not replace the current one nor stay open.
+      await natsClient.close().catch(() => {});
+      if (this.connectionPromise) {
+        return this.connectionPromise;
+      }
+      throw new Error('Connection closed');
+    }
+    this.natsClient = natsClient;
 
     this._status$.next(NatsStatus.CONNECTED);
     void this.handleStatusUpdates(this.natsClient);
@@ -173,6 +215,18 @@ export class ClientNats extends ClientProxy<NatsEvents, NatsStatus> {
         }
       }
     }
+    // The status iterator only completes once the client has given up: it was
+    // closed, or it exhausted `maxReconnectAttempts` and is not coming back.
+    // The promise the "disconnect" case cached is never reset in that case, so
+    // every later `connect()` call would replay the same rejection. Drop the
+    // client and the cached promise so the next call starts over.
+    if (this.natsClient === client) {
+      this.natsClient = null;
+      this.connectionPromise = null;
+      // nats never calls back the reply subscriptions it closes. Fail them
+      // after the reset, so that a request retried from its callback reconnects.
+      this.handleClose();
+    }
   }
 
   public on<
@@ -210,7 +264,13 @@ export class ClientNats extends ClientProxy<NatsEvents, NatsStatus> {
           isDisposed: true,
         });
       }
-      const message = await this.deserializer.deserialize(natsMsg);
+      // nats-core does not await this callback: a rejection here would crash the process.
+      let message: IncomingResponse;
+      try {
+        message = await this.deserializer.deserialize(natsMsg);
+      } catch (err) {
+        return callback({ err, isDisposed: true });
+      }
       if (message.id && message.id !== packet.id) {
         return undefined;
       }
@@ -233,8 +293,14 @@ export class ClientNats extends ClientProxy<NatsEvents, NatsStatus> {
     partialPacket: ReadPacket,
     callback: (packet: WritePacket) => any,
   ): () => void {
+    const packet = this.assignPacketId(partialPacket);
+    this.routingMap.set(packet.id, callback);
+
+    let cleanup = () => {
+      this.routingMap.delete(packet.id);
+    };
+
     try {
-      const packet = this.assignPacketId(partialPacket);
       const channel = this.normalizePattern(partialPacket.pattern);
       const serializedPacket: NatsRecord = this.serializer.serialize(
         packet,
@@ -253,14 +319,20 @@ export class ClientNats extends ClientProxy<NatsEvents, NatsStatus> {
         ) => Promise<never>,
       });
 
+      cleanup = () => {
+        this.routingMap.delete(packet.id);
+        subscription.unsubscribe();
+      };
+
       const headers = this.mergeHeaders(serializedPacket.headers);
       this.natsClient!.publish(channel, serializedPacket.data, {
         reply: inbox,
         headers,
       });
 
-      return () => subscription.unsubscribe();
+      return cleanup;
     } catch (err) {
+      cleanup();
       callback({ err });
       return () => {};
     }

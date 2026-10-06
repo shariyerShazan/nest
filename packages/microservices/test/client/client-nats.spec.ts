@@ -1,4 +1,5 @@
 import { headers as createHeaders } from '@nats-io/transport-node';
+import { firstValueFrom } from 'rxjs';
 import { ClientNats } from '../../client/client-nats.js';
 import { ReadPacket, WritePacket } from '../../interfaces/index.js';
 import { NatsRecord } from '../../record-builders/index.js';
@@ -61,16 +62,16 @@ describe('ClientNats', () => {
       expect(publishSpy.mock.calls[0][0]).toEqual(pattern);
     });
     describe('on error', () => {
-      let assignPacketIdStub: ReturnType<typeof vi.fn>;
+      let serializeStub: ReturnType<typeof vi.fn>;
       beforeEach(() => {
-        assignPacketIdStub = vi
-          .spyOn(client, 'assignPacketId' as any)
+        serializeStub = vi
+          .spyOn(untypedClient.serializer, 'serialize')
           .mockImplementation(() => {
             throw new Error();
           });
       });
       afterEach(() => {
-        assignPacketIdStub.mockRestore();
+        serializeStub.mockRestore();
       });
 
       it('should call callback', () => {
@@ -79,6 +80,38 @@ describe('ClientNats', () => {
 
         expect(callback).toHaveBeenCalled();
         expect(callback.mock.calls[0][0].err).toBeInstanceOf(Error);
+      });
+    });
+    describe('when the send throws after the reply inbox is subscribed', () => {
+      const sendError = new Error('max_payload size exceeded');
+
+      it('should unsubscribe from the inbox and report the error when publish throws', () => {
+        publishSpy.mockImplementation(() => {
+          throw sendError;
+        });
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+
+        expect(unsubscribeSpy).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledWith({ err: sendError });
+        expect(untypedClient.routingMap.size).toBe(0);
+      });
+
+      it('should unsubscribe from the inbox when merging headers throws', () => {
+        const mergeHeadersSpy = vi
+          .spyOn(untypedClient, 'mergeHeaders')
+          .mockImplementation(() => {
+            throw sendError;
+          });
+        const callback = vi.fn();
+
+        client['publish'](msg, callback);
+
+        expect(unsubscribeSpy).toHaveBeenCalledTimes(1);
+        expect(publishSpy).not.toHaveBeenCalled();
+        expect(callback).toHaveBeenCalledWith({ err: sendError });
+        mergeHeadersSpy.mockRestore();
       });
     });
     describe('dispose callback', () => {
@@ -152,6 +185,24 @@ describe('ClientNats', () => {
           'override-client-id',
         );
       });
+    });
+
+    it('should release the inbox when a reply cannot be deserialized', async () => {
+      const error = new SyntaxError('Unexpected token');
+      const undecodable = {
+        data: 'not json',
+        json: () => {
+          throw error;
+        },
+      };
+      const rejection = firstValueFrom(client.send(pattern, 'data'));
+      await vi.waitFor(() => expect(subscribeSpy).toHaveBeenCalled());
+
+      await subscribeSpy.mock.calls[0][1].callback(null, undecodable);
+
+      await expect(rejection).rejects.toBe(error);
+      expect(unsubscribeSpy).toHaveBeenCalledTimes(1);
+      expect(untypedClient.routingMap.size).toBe(0);
     });
   });
 
@@ -237,6 +288,57 @@ describe('ClientNats', () => {
         expect(callback).not.toHaveBeenCalled();
       });
     });
+    describe('reply that cannot be deserialized', () => {
+      const error = new SyntaxError('Unexpected token');
+      const createHandler = () => {
+        client = new ClientNats({});
+        untypedClient = client as any;
+        callback = vi.fn();
+        return client.createSubscriptionHandler(
+          msg,
+          callback as (packet: WritePacket) => any,
+        );
+      };
+
+      it('should fail the request when the deserializer throws', async () => {
+        const handler = createHandler();
+        const undecodable = {
+          data: 'not json',
+          json: () => {
+            throw error;
+          },
+        };
+
+        await expect(handler(null, undecodable)).resolves.toBeUndefined();
+
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledWith({ err: error, isDisposed: true });
+      });
+
+      it('should fail the request when the deserializer rejects', async () => {
+        const handler = createHandler();
+        vi.spyOn(untypedClient.deserializer, 'deserialize').mockRejectedValue(
+          error,
+        );
+
+        await expect(handler(null, natsMessage)).resolves.toBeUndefined();
+
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledWith({ err: error, isDisposed: true });
+      });
+
+      it('should not report a failing callback as an undecodable reply', async () => {
+        const handler = createHandler();
+        const callbackError = new Error('callback failed');
+        callback.mockImplementation(() => {
+          throw callbackError;
+        });
+
+        await expect(handler(null, natsMessage)).rejects.toBe(callbackError);
+
+        expect(callback).toHaveBeenCalledTimes(1);
+      });
+    });
   });
   describe('close', () => {
     let natsClose: ReturnType<typeof vi.fn>;
@@ -250,6 +352,95 @@ describe('ClientNats', () => {
     it('should close "natsClient" when it is not null', async () => {
       await client.close();
       expect(natsClose).toHaveBeenCalled();
+    });
+
+    describe('pending requests', () => {
+      let unsubscribeSpy: ReturnType<typeof vi.fn>;
+
+      beforeEach(() => {
+        client = new ClientNats({});
+        untypedClient = client as any;
+        unsubscribeSpy = vi.fn();
+        natsClose = vi.fn();
+        natsClient = {
+          close: natsClose,
+          subscribe: vi.fn().mockReturnValue({ unsubscribe: unsubscribeSpy }),
+          publish: vi.fn(),
+        };
+        untypedClient.natsClient = natsClient;
+      });
+
+      const publish = (callback: (packet: WritePacket) => any) =>
+        untypedClient.publish({ pattern: 'pattern', data: 'data' }, callback);
+
+      it('should fail pending requests with a connection closed error', async () => {
+        const callback = vi.fn();
+        publish(callback);
+
+        await client.close();
+
+        expect(untypedClient.routingMap.size).toBe(0);
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.objectContaining({ message: 'Connection closed' }),
+        });
+      });
+
+      it('should not call back a request whose teardown already ran', async () => {
+        const callback = vi.fn();
+        const teardown = publish(callback);
+
+        teardown();
+        await client.close();
+
+        expect(callback).not.toHaveBeenCalled();
+        expect(untypedClient.routingMap.size).toBe(0);
+      });
+
+      it('should leave nothing pending behind on a repeated close', async () => {
+        const callback = vi.fn();
+        publish(callback);
+
+        await client.close();
+        await client.close();
+
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(untypedClient.routingMap.size).toBe(0);
+      });
+
+      it('should fail pending requests even when closing the client rejects', async () => {
+        untypedClient.natsClient.close = vi
+          .fn()
+          .mockRejectedValue(new Error('Client closing error'));
+        const callback = vi.fn();
+        publish(callback);
+
+        await expect(client.close()).rejects.toThrow('Client closing error');
+
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.objectContaining({ message: 'Connection closed' }),
+        });
+        expect(untypedClient.natsClient).toBeNull();
+        expect(untypedClient.connectionPromise).toBeNull();
+      });
+
+      it('should fail every pending request and close the client when a callback throws', async () => {
+        vi.spyOn(untypedClient.logger, 'error').mockImplementation(() => {});
+        const throwingCallback = vi.fn().mockImplementation(() => {
+          throw new Error('Callback error');
+        });
+        const callback = vi.fn();
+        publish(throwingCallback);
+        publish(callback);
+
+        await client.close();
+
+        expect(throwingCallback).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.objectContaining({ message: 'Connection closed' }),
+        });
+        expect(untypedClient.routingMap.size).toBe(0);
+        expect(natsClose).toHaveBeenCalled();
+      });
     });
   });
   describe('connect', () => {
@@ -291,6 +482,121 @@ describe('ClientNats', () => {
       });
       it('should not call "handleStatusUpdatesSpy"', () => {
         expect(handleStatusUpdatesSpy).not.toHaveBeenCalled();
+      });
+    });
+    describe('when a stale attempt fails', () => {
+      it('should keep a newer connection when a stale attempt fails', async () => {
+        client = new ClientNats({});
+        untypedClient = client as any;
+        let rejectFirstAttempt!: (err: Error) => void;
+        const firstAttempt = new Promise<never>((_, reject) => {
+          rejectFirstAttempt = reject;
+        });
+        const mockNatsClient = {
+          status: vi.fn().mockReturnValue({
+            // the connection stays alive: next() never resolves
+            [Symbol.asyncIterator]() {
+              return {
+                next: () => new Promise(() => {}),
+                [Symbol.asyncIterator]() {
+                  return this;
+                },
+              };
+            },
+          }),
+          close: vi.fn().mockResolvedValue(undefined),
+        };
+
+        const createClientSpy = vi
+          .spyOn(client, 'createClient')
+          .mockImplementationOnce(() => firstAttempt)
+          .mockImplementation(() => Promise.resolve(mockNatsClient));
+
+        const firstConnect = client.connect();
+        // Let the first attempt cache its promise before the close().
+        await new Promise(process.nextTick);
+        await client.close();
+        const liveClient = await client.connect();
+        const cachedPromise = untypedClient.connectionPromise;
+
+        rejectFirstAttempt(new Error('connection refused'));
+        await expect(firstConnect).rejects.toThrow('connection refused');
+
+        // A rejected attempt must not clear the newer attempt's cached
+        // promise, close() followed by connect() would otherwise orphan the
+        // newer live client on the next connect().
+        expect(untypedClient.connectionPromise).toBe(cachedPromise);
+        expect(untypedClient.natsClient).toBe(liveClient);
+
+        expect(await client.connect()).toBe(liveClient);
+        expect(createClientSpy).toHaveBeenCalledTimes(2);
+
+        await client.close();
+      });
+    });
+    describe('when a stale attempt succeeds', () => {
+      const createMockNatsClient = () => ({
+        status: vi.fn().mockReturnValue({
+          // the connection stays alive: next() never resolves
+          [Symbol.asyncIterator]() {
+            return {
+              next: () => new Promise(() => {}),
+              [Symbol.asyncIterator]() {
+                return this;
+              },
+            };
+          },
+        }),
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+      let resolveFirstAttempt: (natsClient: any) => void;
+      let staleNatsClient: ReturnType<typeof createMockNatsClient>;
+      let liveNatsClient: ReturnType<typeof createMockNatsClient>;
+
+      beforeEach(() => {
+        client = new ClientNats({});
+        untypedClient = client as any;
+        staleNatsClient = createMockNatsClient();
+        liveNatsClient = createMockNatsClient();
+        const firstAttempt = new Promise<any>(resolve => {
+          resolveFirstAttempt = resolve;
+        });
+        vi.spyOn(client, 'createClient')
+          .mockImplementationOnce(() => firstAttempt)
+          .mockImplementation(() => Promise.resolve(liveNatsClient as any));
+      });
+
+      it('should close the stale connection and keep the newer one', async () => {
+        const firstConnect = client.connect();
+        // Let the first attempt cache its promise before the close().
+        await new Promise(process.nextTick);
+        await client.close();
+        const liveClient = await client.connect();
+
+        resolveFirstAttempt(staleNatsClient);
+        expect(await firstConnect).toBe(liveClient);
+
+        expect(staleNatsClient.close).toHaveBeenCalled();
+        expect(liveNatsClient.close).not.toHaveBeenCalled();
+        expect(untypedClient.natsClient).toBe(liveClient);
+        expect(staleNatsClient.status).not.toHaveBeenCalled();
+
+        await client.close();
+        expect(liveNatsClient.close).toHaveBeenCalled();
+      });
+      it('should close the stale connection when the client was closed', async () => {
+        const firstConnect = client.connect();
+        // Let the first attempt cache its promise before the close().
+        await new Promise(process.nextTick);
+        await client.close();
+
+        resolveFirstAttempt(staleNatsClient);
+        await expect(firstConnect).rejects.toThrow('Connection closed');
+
+        expect(staleNatsClient.close).toHaveBeenCalled();
+        expect(staleNatsClient.status).not.toHaveBeenCalled();
+        expect(untypedClient.natsClient).toBeNull();
+        expect(untypedClient.connectionPromise).toBeNull();
       });
     });
   });
@@ -346,6 +652,130 @@ describe('ClientNats', () => {
       expect(logSpy).toHaveBeenCalledWith(
         'NatsStatus: type: "warn", data: "{}".',
       );
+    });
+  });
+  describe('when the client gives up', () => {
+    let client: ClientNats;
+    let untypedClient: any;
+
+    beforeEach(() => {
+      client = new ClientNats({});
+      untypedClient = client as any;
+    });
+
+    it('should start a new connection when the status iterator completes', async () => {
+      let releaseIterator: () => void;
+      const iteratorReachedEnd = new Promise<void>(resolve => {
+        releaseIterator = resolve;
+      });
+
+      const firstClient = {
+        status: () => ({
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'disconnect' };
+            await iteratorReachedEnd;
+          },
+        }),
+        close: vi.fn(),
+      };
+      const secondClient = {
+        status: () => ({
+          async *[Symbol.asyncIterator]() {
+            // stays connected
+          },
+        }),
+        close: vi.fn(),
+      };
+      const createClientSpy = vi
+        .spyOn(client, 'createClient')
+        .mockResolvedValueOnce(firstClient as any)
+        .mockResolvedValueOnce(secondClient as any);
+
+      await client.connect();
+      await vi.waitFor(async () => {
+        expect(untypedClient.connectionPromise).toBeTruthy();
+        await expect(untypedClient.connectionPromise).rejects.toBe(
+          'Error: Connection lost. Trying to reconnect...',
+        );
+      });
+
+      await expect(client.connect()).rejects.toBe(
+        'Error: Connection lost. Trying to reconnect...',
+      );
+
+      releaseIterator!();
+      await vi.waitFor(() =>
+        expect(untypedClient.connectionPromise).toBeNull(),
+      );
+      expect(untypedClient.natsClient).toBeNull();
+
+      await client.connect();
+      expect(createClientSpy).toHaveBeenCalledTimes(2);
+      createClientSpy.mockRestore();
+    });
+
+    describe('with a pending request', () => {
+      const secondClient = {
+        status: () => ({
+          async *[Symbol.asyncIterator]() {
+            // stays connected
+          },
+        }),
+        close: vi.fn(),
+      };
+      let releaseIterator: () => void;
+      let createClientSpy: ReturnType<typeof vi.fn>;
+
+      beforeEach(async () => {
+        const iteratorReachedEnd = new Promise<void>(resolve => {
+          releaseIterator = resolve;
+        });
+        const natsClient = {
+          status: () => ({
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'disconnect' };
+              await iteratorReachedEnd;
+            },
+          }),
+          subscribe: vi.fn().mockReturnValue({ unsubscribe: vi.fn() }),
+          publish: vi.fn(),
+          close: vi.fn(),
+        };
+        createClientSpy = vi
+          .spyOn(client, 'createClient')
+          .mockResolvedValueOnce(natsClient as any)
+          .mockResolvedValueOnce(secondClient as any);
+        await client.connect();
+      });
+      afterEach(() => {
+        createClientSpy.mockRestore();
+      });
+
+      it('should fail pending requests when the status iterator completes', async () => {
+        const callback = vi.fn();
+        untypedClient.publish({ pattern: 'pattern', data: 'data' }, callback);
+
+        releaseIterator();
+        await vi.waitFor(() => expect(untypedClient.natsClient).toBeNull());
+
+        expect(callback).toHaveBeenCalledWith({
+          err: expect.objectContaining({ message: 'Connection closed' }),
+        });
+        expect(untypedClient.routingMap.size).toBe(0);
+      });
+
+      it('should start a new connection when a failed request retries from its callback', async () => {
+        let retry: Promise<any> | undefined;
+        untypedClient.publish({ pattern: 'pattern', data: 'data' }, () => {
+          retry = client.connect();
+        });
+
+        releaseIterator();
+        await vi.waitFor(() => expect(retry).toBeDefined());
+
+        await expect(retry).resolves.toBe(secondClient);
+        expect(createClientSpy).toHaveBeenCalledTimes(2);
+      });
     });
   });
   describe('dispatchEvent', () => {

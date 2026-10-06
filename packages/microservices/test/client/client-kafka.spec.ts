@@ -152,6 +152,7 @@ describe('ClientKafka', () => {
   let untypedClient: any;
   let callback: ReturnType<typeof vi.fn>;
   let connect: ReturnType<typeof vi.fn>;
+  let disconnect: ReturnType<typeof vi.fn>;
   let subscribe: ReturnType<typeof vi.fn>;
   let run: ReturnType<typeof vi.fn>;
   let send: ReturnType<typeof vi.fn>;
@@ -167,6 +168,7 @@ describe('ClientKafka', () => {
 
     callback = vi.fn();
     connect = vi.fn();
+    disconnect = vi.fn().mockResolvedValue(undefined);
     subscribe = vi.fn();
     run = vi.fn();
     send = vi.fn();
@@ -175,6 +177,7 @@ describe('ClientKafka', () => {
     consumerStub = vi.fn().mockImplementation(() => {
       return {
         connect,
+        disconnect,
         subscribe,
         run,
         events: {
@@ -201,6 +204,7 @@ describe('ClientKafka', () => {
     producerStub = vi.fn().mockImplementation(() => {
       return {
         connect,
+        disconnect,
         send,
         events: {
           CONNECT: 'producer.connect',
@@ -280,6 +284,9 @@ describe('ClientKafka', () => {
       untypedClient._consumer = consumer;
       untypedClient._producer = producer;
     });
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
     it('should close server', async () => {
       await client.close();
 
@@ -288,6 +295,47 @@ describe('ClientKafka', () => {
       expect(untypedClient._consumer).toBeNull();
       expect(untypedClient._producer).toBeNull();
       expect(untypedClient.client).toBeNull();
+    });
+
+    it('should fail pending requests with a connection closed error', async () => {
+      const callback = vi.fn();
+      untypedClient.routingMap.set('some id', callback);
+
+      await client.close();
+
+      expect(untypedClient.routingMap.size).toBe(0);
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+    });
+
+    it('should fail every pending request when a callback throws', async () => {
+      const loggerErrorSpy = vi
+        .spyOn(untypedClient.logger, 'error')
+        .mockImplementation(() => {});
+      const throwingCallback = vi.fn().mockImplementation(() => {
+        throw new Error('Callback error');
+      });
+      let pendingDuringFlush: number | undefined;
+      const callback = vi.fn(() => {
+        pendingDuringFlush = untypedClient.routingMap.size;
+      });
+      untypedClient.routingMap.set('some id', throwingCallback);
+      untypedClient.routingMap.set('some other id', callback);
+
+      await client.close();
+
+      expect(throwingCallback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith({
+        err: expect.objectContaining({ message: 'Connection closed' }),
+      });
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Callback error' }),
+      );
+      expect(pendingDuringFlush).toBe(0);
+      expect(producer.disconnect).toHaveBeenCalled();
+      expect(consumer.disconnect).toHaveBeenCalled();
+      expect(untypedClient.routingMap.size).toBe(0);
     });
   });
 
@@ -372,6 +420,78 @@ describe('ClientKafka', () => {
         expect(connect).not.toHaveBeenCalledTimes(2);
 
         expect(bindTopicsStub).not.toHaveBeenCalled();
+      });
+
+      it('should discard the partial connection when an attempt fails', async () => {
+        const error = new Error('broker unavailable');
+        // The consumer connects, then the producer fails.
+        connect.mockResolvedValueOnce(undefined).mockRejectedValueOnce(error);
+
+        await expect(client.connect()).rejects.toThrow(error);
+
+        expect(untypedClient.initialized).toBeNull();
+        expect(untypedClient._consumer).toBeNull();
+        expect(untypedClient._producer).toBeNull();
+        expect(untypedClient.client).toBeNull();
+        // Both the consumer that joined its group and the producer are torn down.
+        expect(disconnect).toHaveBeenCalledTimes(2);
+      });
+
+      it('should try again on the next call instead of caching a failed attempt', async () => {
+        const error = new Error('broker unavailable');
+        connect.mockRejectedValueOnce(error);
+
+        await expect(client.connect()).rejects.toThrow(error);
+        const connection = await client.connect();
+
+        expect(createClientStub).toHaveBeenCalledTimes(2);
+        expect(consumerStub).toHaveBeenCalledTimes(2);
+        expect(producerStub).toHaveBeenCalledOnce();
+        expect(connection).toEqual(producerStub());
+      });
+
+      it('should not discard a newer connection when a stale attempt fails', async () => {
+        let rejectFirstAttempt!: (err: Error) => void;
+        const firstDisconnect = vi.fn().mockResolvedValue(undefined);
+        const secondDisconnect = vi.fn().mockResolvedValue(undefined);
+        const createConsumer = consumerStub.getMockImplementation()!;
+        const createProducer = producerStub.getMockImplementation()!;
+        consumerStub
+          .mockImplementationOnce(() => ({
+            ...createConsumer(),
+            connect: () =>
+              new Promise<void>((_, reject) => (rejectFirstAttempt = reject)),
+            disconnect: firstDisconnect,
+          }))
+          .mockImplementationOnce(() => ({
+            ...createConsumer(),
+            disconnect: secondDisconnect,
+          }));
+        producerStub.mockImplementationOnce(() => ({
+          ...createProducer(),
+          disconnect: secondDisconnect,
+        }));
+
+        const firstAttempt = client.connect();
+        // Let the first attempt reach the (pending) consumer connection.
+        await new Promise(process.nextTick);
+        await client.close();
+        firstDisconnect.mockClear();
+        const secondAttempt = client.connect();
+        await secondAttempt;
+        const secondConsumer = untypedClient._consumer;
+        const secondProducer = untypedClient._producer;
+
+        rejectFirstAttempt(new Error('broker unavailable'));
+        await expect(firstAttempt).rejects.toThrow('broker unavailable');
+
+        expect(untypedClient._consumer).toBe(secondConsumer);
+        expect(untypedClient._producer).toBe(secondProducer);
+        expect(untypedClient.client).not.toBeNull();
+        expect(untypedClient.initialized).not.toBeNull();
+        expect(secondDisconnect).not.toHaveBeenCalled();
+        // The stale attempt still disconnects the consumer it created.
+        expect(firstDisconnect).toHaveBeenCalledOnce();
       });
     });
 

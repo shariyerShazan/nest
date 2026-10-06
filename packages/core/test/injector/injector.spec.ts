@@ -231,6 +231,38 @@ describe('Injector', () => {
       getCtorMetadataSpy.mockRestore();
       loadCtorMetadataSpy.mockRestore();
     });
+
+    it(
+      'should reject instead of hanging when a factory provider inject array is sparse',
+      { timeout: 500 },
+      async () => {
+        const inject: unknown[] = [];
+        inject[0] = 'A';
+        inject[2] = 'C';
+
+        const container = new NestContainer();
+        const { moduleRef } = (await container.addModule(
+          class TestModule {},
+          [],
+        ))!;
+        moduleRef.addProvider({ provide: 'A', useValue: 'a' });
+        moduleRef.addProvider({ provide: 'C', useValue: 'c' });
+
+        const wrapper = new InstanceWrapper({
+          name: 'X',
+          inject: inject as any,
+        });
+
+        await expect(
+          injector.resolveConstructorParams(
+            wrapper,
+            moduleRef,
+            inject as any,
+            () => {},
+          ),
+        ).rejects.toThrow(UndefinedDependencyException);
+      },
+    );
   });
 
   describe('loadMiddleware', () => {
@@ -840,6 +872,45 @@ describe('Injector', () => {
   });
 
   describe('loadEnhancersPerContext', () => {
+    it('should resolve an explicit enhancer list without changing a singleton dependency tree', async () => {
+      class Gateway {}
+      @Injectable({ scope: Scope.TRANSIENT })
+      class Enhancer {
+        readonly constructed = true;
+      }
+      const moduleRef = new Module(class {}, new NestContainer());
+      moduleRef.addProvider(Gateway);
+      moduleRef.addInjectable(Enhancer, 'guard');
+      const wrapper = moduleRef.providers.get(Gateway)!;
+      const enhancer = moduleRef.injectables.get(Enhancer)!;
+      const firstContext = { id: 1 };
+      const secondContext = { id: 2 };
+
+      await injector.loadEnhancersPerContext(wrapper, firstContext, wrapper, [
+        enhancer,
+      ]);
+      const firstInstance = enhancer.getInstanceByContextId(
+        firstContext,
+        wrapper.id,
+      ).instance;
+      await injector.loadEnhancersPerContext(wrapper, firstContext, wrapper, [
+        enhancer,
+      ]);
+      await injector.loadEnhancersPerContext(wrapper, secondContext, wrapper, [
+        enhancer,
+      ]);
+
+      expect(firstInstance.constructed).toBe(true);
+      expect(
+        enhancer.getInstanceByContextId(firstContext, wrapper.id).instance,
+      ).toBe(firstInstance);
+      expect(
+        enhancer.getInstanceByContextId(secondContext, wrapper.id).instance,
+      ).not.toBe(firstInstance);
+      expect(wrapper.isDependencyTreeStatic()).toBe(true);
+      expect(wrapper.getEnhancersMetadata()).toBeUndefined();
+    });
+
     it('should load enhancers per context id', async () => {
       const contextId = { id: 1 };
       const wrapper = new InstanceWrapper();
@@ -973,6 +1044,75 @@ describe('Injector', () => {
       const paramtypes = Reflect.getMetadata(PARAMTYPES_METADATA, FixtureClass);
       expect(paramtypes).toEqual([FixtureDep1]);
     });
+
+    describe('when the class extends a class with @Optional() constructor parameters', () => {
+      class FixtureDep1 {}
+      class FixtureDep2 {}
+
+      @Injectable()
+      class ParentClass {
+        constructor(
+          private dep1: FixtureDep1,
+          @Optional() private dep2: FixtureDep2,
+        ) {}
+      }
+
+      it('should inherit the optional dep ids when the constructor is not redeclared', () => {
+        @Injectable()
+        class ChildClass extends ParentClass {}
+
+        @Injectable()
+        class GrandChildClass extends ChildClass {}
+
+        for (const metatype of [ChildClass, GrandChildClass]) {
+          const wrapper = new InstanceWrapper({ metatype });
+          const [dependencies, optionalDependenciesIds] =
+            injector.getClassDependencies(wrapper);
+
+          expect(dependencies).toEqual([FixtureDep1, FixtureDep2]);
+          expect(optionalDependenciesIds).toEqual([1]);
+        }
+      });
+
+      it('should use only its own optional dep ids when the constructor is redeclared', () => {
+        @Injectable()
+        class ChildClass extends ParentClass {
+          constructor(dep2: FixtureDep2, @Optional() dep1: FixtureDep1) {
+            super(dep1, dep2);
+          }
+        }
+
+        @Injectable()
+        class ChildWithoutOptionalClass extends ParentClass {
+          constructor(dep1: FixtureDep1, dep2: FixtureDep2) {
+            super(dep1, dep2);
+          }
+        }
+
+        @Injectable()
+        class ChildWithEmptyConstructorClass extends ParentClass {
+          constructor() {
+            super(new FixtureDep1(), new FixtureDep2());
+          }
+        }
+
+        expect(
+          injector.getClassDependencies(
+            new InstanceWrapper({ metatype: ChildClass }),
+          ),
+        ).toEqual([[FixtureDep2, FixtureDep1], [1]]);
+        expect(
+          injector.getClassDependencies(
+            new InstanceWrapper({ metatype: ChildWithoutOptionalClass }),
+          ),
+        ).toEqual([[FixtureDep1, FixtureDep2], []]);
+        expect(
+          injector.getClassDependencies(
+            new InstanceWrapper({ metatype: ChildWithEmptyConstructorClass }),
+          ),
+        ).toEqual([[], []]);
+      });
+    });
   });
 
   describe('getFactoryProviderDependencies', () => {
@@ -1021,6 +1161,21 @@ describe('Injector', () => {
       const wrapper = new InstanceWrapper({
         name: 'TOKEN',
         inject: [{ token: null } as any],
+      });
+
+      expect(() => injector.getFactoryProviderDependencies(wrapper)).toThrow(
+        UndefinedDependencyException,
+      );
+    });
+
+    it('should throw "UndefinedDependencyException" when inject is a sparse array', () => {
+      const inject: unknown[] = [];
+      inject[0] = 'A';
+      inject[2] = 'C';
+
+      const wrapper = new InstanceWrapper({
+        name: 'TOKEN',
+        inject: inject as any,
       });
 
       expect(() => injector.getFactoryProviderDependencies(wrapper)).toThrow(

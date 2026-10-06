@@ -24,6 +24,8 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
   protected readonly socketClass: Type<TcpSocket>;
   protected readonly tlsOptions?: ConnectionOptions;
   protected readonly maxBufferSize?: number;
+  protected readonly incompleteMessageTimeout?: number;
+  protected readonly maxSendBufferSize?: number;
   protected socket: TcpSocket | null = null;
   protected connectionPromise: Promise<any> | null = null;
   protected pendingEventListeners: Array<{
@@ -38,6 +40,11 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
     this.socketClass = this.getOptionsProp(options, 'socketClass', JsonSocket);
     this.tlsOptions = this.getOptionsProp(options, 'tlsOptions');
     this.maxBufferSize = this.getOptionsProp(options, 'maxBufferSize');
+    this.incompleteMessageTimeout = this.getOptionsProp(
+      options,
+      'incompleteMessageTimeout',
+    );
+    this.maxSendBufferSize = this.getOptionsProp(options, 'maxSendBufferSize');
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
@@ -47,19 +54,22 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
     if (this.connectionPromise) {
       return this.connectionPromise;
     }
-    this.socket = this.createSocket();
-    this.registerConnectListener(this.socket);
-    this.registerCloseListener(this.socket);
-    this.registerErrorListener(this.socket);
+    const socket = this.createSocket();
+    this.socket = socket;
+    this.registerConnectListener(socket);
+    this.registerCloseListener(socket);
+    this.registerErrorListener(socket);
 
     this.pendingEventListeners.forEach(({ event, callback }) =>
-      this.socket!.on(event, callback as any),
+      socket.on(event, callback as any),
     );
-    this.pendingEventListeners = [];
 
-    const source$ = this.connect$(this.socket.netSocket).pipe(
+    const source$ = this.connect$(socket.netSocket).pipe(
       tap(() => {
-        this.socket!.on('message', (buffer: WritePacket & PacketId) =>
+        // A socket replaced by a newer `connect()` call (`close()` followed by
+        // `connect()` while it was still connecting) still finishes connecting,
+        // so its listener must stay on it instead of `this.socket`.
+        socket.on('message', (buffer: WritePacket & PacketId) =>
           this.handleResponse(buffer),
         );
       }),
@@ -68,7 +78,7 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
 
     // For TLS connections, the connection is initiated when the socket is created
     if (!this.tlsOptions) {
-      this.socket.connect(this.port, this.host);
+      socket.connect(this.port, this.host);
     }
     this.connectionPromise = lastValueFrom(source$).catch(err => {
       if (err instanceof EmptyError) {
@@ -114,11 +124,18 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
     } else {
       socket = new net.Socket();
     }
-    // Pass maxBufferSize only if socketClass is JsonSocket
-    // For custom socket classes, users should handle maxBufferSize in their own implementation
-    if (this.maxBufferSize !== undefined && this.socketClass === JsonSocket) {
+    // Pass the framing options only if socketClass is JsonSocket
+    // For custom socket classes, users should handle them in their own implementation
+    const hasJsonSocketOptions =
+      this.maxBufferSize !== undefined ||
+      this.incompleteMessageTimeout !== undefined ||
+      this.maxSendBufferSize !== undefined;
+
+    if (hasJsonSocketOptions && this.socketClass === JsonSocket) {
       return new this.socketClass(socket, {
         maxBufferSize: this.maxBufferSize,
+        incompleteMessageTimeout: this.incompleteMessageTimeout,
+        maxSendBufferSize: this.maxSendBufferSize,
       });
     }
     return new this.socketClass(socket);
@@ -132,6 +149,9 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
 
   public registerConnectListener(socket: TcpSocket) {
     socket.on(TcpEventsMap.CONNECT, () => {
+      if (this.isReplacedSocket(socket)) {
+        return;
+      }
       this._status$.next(TcpStatus.CONNECTED);
     });
   }
@@ -140,7 +160,7 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
     socket.on(TcpEventsMap.ERROR, err => {
       if (err.code !== ECONNREFUSED) {
         this.handleError(err);
-      } else {
+      } else if (!this.isReplacedSocket(socket)) {
         this._status$.next(TcpStatus.DISCONNECTED);
       }
     });
@@ -148,9 +168,21 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
 
   public registerCloseListener(socket: TcpSocket) {
     socket.on(TcpEventsMap.CLOSE, () => {
+      if (this.isReplacedSocket(socket)) {
+        return;
+      }
       this._status$.next(TcpStatus.DISCONNECTED);
       this.handleClose();
     });
+  }
+
+  /**
+   * Whether a newer `connect()` call has replaced `socket` (e.g., `close()`
+   * followed by `connect()` before it finished closing), so its late events
+   * must not tear down or report on the newer connection.
+   */
+  private isReplacedSocket(socket: TcpSocket): boolean {
+    return this.socket !== null && this.socket !== socket;
   }
 
   public handleError(err: any) {
@@ -163,10 +195,18 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
 
     if (this.routingMap.size > 0) {
       const err = new Error('Connection closed');
-      for (const callback of this.routingMap.values()) {
-        callback({ err });
-      }
+      const callbacks = [...this.routingMap.values()];
       this.routingMap.clear();
+
+      for (const callback of callbacks) {
+        try {
+          callback({ err });
+        } catch (callbackErr) {
+          // A failing callback must not keep the remaining requests pending
+          // nor prevent the connection from being closed.
+          this.logger.error(callbackErr);
+        }
+      }
     }
   }
 
@@ -174,10 +214,11 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
     EventKey extends keyof TcpEvents = keyof TcpEvents,
     EventCallback extends TcpEvents[EventKey] = TcpEvents[EventKey],
   >(event: EventKey, callback: EventCallback) {
+    // Kept until `close()`, so the sockets created later (e.g., after the
+    // server dropped the connection) get it as well
+    this.pendingEventListeners.push({ event, callback });
     if (this.socket) {
       this.socket.on(event, callback as any);
-    } else {
-      this.pendingEventListeners.push({ event, callback });
     }
   }
 
@@ -194,15 +235,19 @@ export class ClientTCP extends ClientProxy<TcpEvents, TcpStatus> {
     partialPacket: ReadPacket,
     callback: (packet: WritePacket) => any,
   ): () => void {
+    let cleanup = () => {};
     try {
       const packet = this.assignPacketId(partialPacket);
       const serializedPacket = this.serializer.serialize(packet);
 
       this.routingMap.set(packet.id, callback);
+      cleanup = () => this.routingMap.delete(packet.id);
+
       this.socket!.sendMessage(serializedPacket);
 
-      return () => this.routingMap.delete(packet.id);
+      return cleanup;
     } catch (err) {
+      cleanup();
       callback({ err });
       return () => {};
     }

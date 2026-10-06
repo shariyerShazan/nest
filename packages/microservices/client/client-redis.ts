@@ -60,6 +60,8 @@ export class ClientRedis extends ClientProxy<RedisEvents, RedisStatus> {
     this.subClient && (await this.subClient.quit());
     this.pubClient = this.subClient = null;
     this.connectionPromise = null;
+    this.isManuallyClosed = false;
+    this.wasInitialConnectionSuccessful = false;
     this.pendingEventListeners = [];
   }
 
@@ -67,8 +69,45 @@ export class ClientRedis extends ClientProxy<RedisEvents, RedisStatus> {
     if (this.connectionPromise) {
       return this.connectionPromise;
     }
-    this.connectionPromise = this.handleConnection();
-    return this.connectionPromise;
+    const connectionPromise = this.handleConnection().catch(err => {
+      // Once the clients are connecting, the "reconnecting", "ready" and "end"
+      // listeners take over `connectionPromise`: ioredis keeps retrying in
+      // the background, and "end" resets the state once it gives up. If none
+      // of them did, nothing else is going to reset it, so do it here to let
+      // the next `connect()` call try again.
+      if (this.connectionPromise === connectionPromise) {
+        this.discardClients();
+      }
+      throw err;
+    });
+    this.connectionPromise = connectionPromise;
+    return connectionPromise;
+  }
+
+  /**
+   * Drops the current pub/sub pair, so the next `connect()` call starts over
+   * with new clients. Events the dropped clients emit from now on are ignored.
+   */
+  private discardClients() {
+    const clients = [this.pubClient, this.subClient];
+    this.pubClient = this.subClient = null;
+    this.connectionPromise = null;
+    this.wasInitialConnectionSuccessful = false;
+
+    for (const client of clients) {
+      // An ended client has no connection or pending retry left to stop
+      if (client && client.status !== 'end') {
+        client.disconnect();
+      }
+    }
+  }
+
+  /**
+   * Whether `client` belongs to the current pub/sub pair, as opposed to a
+   * client that has been dropped and is still shutting down.
+   */
+  private isCurrentClient(client: unknown): boolean {
+    return client === this.pubClient || client === this.subClient;
   }
 
   private async handleConnection(): Promise<any> {
@@ -85,7 +124,6 @@ export class ClientRedis extends ClientProxy<RedisEvents, RedisStatus> {
         client.on(event, (...args: [any]) => callback(type, ...args)),
       );
     });
-    this.pendingEventListeners = [];
 
     await Promise.all([this.subClient.connect(), this.pubClient.connect()]);
   }
@@ -117,7 +155,7 @@ export class ClientRedis extends ClientProxy<RedisEvents, RedisStatus> {
     on: (event: string, fn: () => void) => void;
   }) {
     client.on(RedisEventsMap.RECONNECTING, () => {
-      if (this.isManuallyClosed) {
+      if (this.isManuallyClosed || !this.isCurrentClient(client)) {
         return;
       }
 
@@ -140,6 +178,9 @@ export class ClientRedis extends ClientProxy<RedisEvents, RedisStatus> {
     on: (event: string, fn: () => void) => void;
   }) {
     client.on(RedisEventsMap.READY, () => {
+      if (!this.isCurrentClient(client)) {
+        return;
+      }
       this.connectionPromise = Promise.resolve();
       this._status$.next(RedisStatus.CONNECTED);
 
@@ -159,38 +200,35 @@ export class ClientRedis extends ClientProxy<RedisEvents, RedisStatus> {
     on: (event: string, fn: () => void) => void;
   }) {
     client.on('end', () => {
-      if (this.isManuallyClosed) {
+      if (this.isManuallyClosed || !this.isCurrentClient(client)) {
         return;
       }
       this._status$.next(RedisStatus.DISCONNECTED);
       this.handleClose();
+      this.logger.error('Disconnected from Redis.');
 
-      if (this.getOptionsProp(this.options, 'retryAttempts') === undefined) {
-        // When retryAttempts is not specified, the connection will not be re-established
-        this.logger.error('Disconnected from Redis.');
-
-        // Clean up client instances and just recreate them when connect is called
-        this.pubClient = this.subClient = null;
-        this.connectionPromise = null;
-      } else {
-        this.logger.error('Disconnected from Redis.');
-        this.connectionPromise = Promise.reject(
-          'Error: Connection lost. Trying to reconnect...',
-        );
-
-        // Prevent unhandled rejections
-        this.connectionPromise.catch(() => {});
-      }
+      // ioredis gave up on this client (retry attempts not specified or
+      // exhausted), so drop the pair and let the next `connect()` call
+      // create a new one
+      this.discardClients();
     });
   }
 
   public handleClose() {
     if (this.routingMap.size > 0) {
       const err = new Error('Connection closed');
-      for (const callback of this.routingMap.values()) {
-        callback({ err });
-      }
+      const callbacks = [...this.routingMap.values()];
       this.routingMap.clear();
+
+      for (const callback of callbacks) {
+        try {
+          callback({ err });
+        } catch (callbackErr) {
+          // A failing callback must not keep the remaining requests pending
+          // nor prevent the connection from being closed.
+          this.logger.error(callbackErr);
+        }
+      }
     }
     this.subscriptionsCount.clear();
   }
@@ -208,11 +246,11 @@ export class ClientRedis extends ClientProxy<RedisEvents, RedisStatus> {
     EventKey extends keyof RedisEvents = keyof RedisEvents,
     EventCallback extends RedisEvents[EventKey] = RedisEvents[EventKey],
   >(event: EventKey, callback: EventCallback) {
+    // Kept until `close()`, so the pairs created later get it as well
+    this.pendingEventListeners.push({ event, callback });
     if (this.subClient && this.pubClient) {
       this.subClient.on(event, (...args: [any]) => callback('sub', ...args));
       this.pubClient.on(event, (...args: [any]) => callback('pub', ...args));
-    } else {
-      this.pendingEventListeners.push({ event, callback });
     }
   }
 
@@ -295,30 +333,63 @@ export class ClientRedis extends ClientProxy<RedisEvents, RedisStatus> {
       const responseChannel = this.getReplyPattern(pattern);
       let subscriptionsCount =
         this.subscriptionsCount.get(responseChannel) || 0;
+      let isPublished = false;
+      let isTornDown = false;
+
+      const undoBookkeeping = () => {
+        isTornDown = true;
+        isPublished = false;
+        this.subscriptionsCount.set(
+          responseChannel,
+          (this.subscriptionsCount.get(responseChannel) || 1) - 1,
+        );
+        this.routingMap.delete(packet.id);
+      };
 
       const publishPacket = () => {
+        if (isTornDown) {
+          return;
+        }
         subscriptionsCount = this.subscriptionsCount.get(responseChannel) || 0;
         this.subscriptionsCount.set(responseChannel, subscriptionsCount + 1);
         this.routingMap.set(packet.id, callback);
-        this.pubClient.publish(
-          this.getRequestPattern(pattern),
-          JSON.stringify(serializedPacket),
-        );
+        isPublished = true;
+
+        try {
+          this.pubClient.publish(
+            this.getRequestPattern(pattern),
+            JSON.stringify(serializedPacket),
+          );
+        } catch (err) {
+          // The broker can acknowledge the subscription later, so this runs
+          // outside the outer catch and has to undo its own work. Only the
+          // bookkeeping though: a concurrent request on this pattern may still
+          // be waiting for its own subscribe reply, so the broker subscription
+          // is left to self-heal, as in #17671.
+          undoBookkeeping();
+          callback({ err });
+        }
+      };
+
+      const cleanup = () => {
+        isTornDown = true;
+        if (!isPublished) {
+          return;
+        }
+        isPublished = false;
+        this.unsubscribeFromChannel(responseChannel);
+        this.routingMap.delete(packet.id);
       };
 
       if (subscriptionsCount <= 0) {
-        this.subClient.subscribe(
-          responseChannel,
-          (err: any) => !err && publishPacket(),
+        this.subClient.subscribe(responseChannel, (err: any) =>
+          err ? callback({ err }) : publishPacket(),
         );
       } else {
         publishPacket();
       }
 
-      return () => {
-        this.unsubscribeFromChannel(responseChannel);
-        this.routingMap.delete(packet.id);
-      };
+      return cleanup;
     } catch (err) {
       callback({ err });
       return () => {};

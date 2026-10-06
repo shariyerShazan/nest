@@ -35,7 +35,7 @@ import {
 } from '../interfaces/packet.interface.js';
 import { RmqRecordSerializer } from '../serializers/rmq-record.serializer.js';
 import { Server } from './server.js';
-import { isNil, isString, isUndefined } from '@nestjs/common/internal';
+import { isNil, isUndefined } from '@nestjs/common/internal';
 
 // To enable type safety for RMQ. This cant be uncommented by default
 // because it would require the user to install the amqplib package even if they dont use RabbitMQ
@@ -111,6 +111,12 @@ export class ServerRMQ extends Server<RmqEvents, RmqStatus> {
     callback?: (err?: unknown, ...optionalParams: unknown[]) => void,
   ) {
     this.server = await this.createClient();
+    let listenCallback = callback;
+    const settleListenCallback = (...args: unknown[]) => {
+      const cb = listenCallback;
+      listenCallback = undefined;
+      cb?.(...args);
+    };
     this.server!.once(RmqEventsMap.CONNECT, () => {
       if (this.channel) {
         return;
@@ -118,7 +124,24 @@ export class ServerRMQ extends Server<RmqEvents, RmqStatus> {
       this._status$.next(RmqStatus.CONNECTED);
       this.channel = this.server!.createChannel({
         json: false,
-        setup: (channel: Channel) => this.setupChannel(channel, callback!),
+        setup: (channel: Channel) =>
+          this.setupChannel(channel, settleListenCallback),
+      });
+      // The wrapper emits "error" when the setup throws, and an unhandled emit
+      // crashes the process. A later error is only logged: the callback
+      // settles once.
+      this.channel.on(RmqEventsMap.ERROR, (err: unknown) => {
+        this.logger.error(err);
+        const cb = listenCallback;
+        if (!cb) {
+          return;
+        }
+        listenCallback = undefined;
+        // Otherwise the wrapper re-runs the setup on every reconnect, and the
+        // server would start consuming after "listen()" has failed.
+        void this.close()
+          .catch(closeErr => this.logger.error(closeErr))
+          .then(() => cb(err));
       });
     });
 
@@ -156,7 +179,9 @@ export class ServerRMQ extends Server<RmqEvents, RmqStatus> {
         }
         if (++this.connectionAttempts === maxConnectionAttempts) {
           await this.close();
-          callback?.(error.err ?? new Error(CONNECTION_FAILED_MESSAGE));
+          settleListenCallback(
+            error.err ?? new Error(CONNECTION_FAILED_MESSAGE),
+          );
         }
       },
     );
@@ -273,9 +298,10 @@ export class ServerRMQ extends Server<RmqEvents, RmqStatus> {
     }
 
     await channel.prefetch(prefetchCount, isGlobalPrefetchCount);
-    channel.consume(
+    await channel.consume(
       createdQueue,
-      (msg: Record<string, any> | null) => this.handleMessage(msg!, channel),
+      (msg: Record<string, any> | null) =>
+        this.handleMessage(msg!, channel).catch(err => this.handleError(err)),
       {
         noAck: this.noAck,
         consumerTag: this.getOptionsProp(
@@ -298,9 +324,7 @@ export class ServerRMQ extends Server<RmqEvents, RmqStatus> {
     const { content, properties } = message;
     const rawMessage = this.parseMessageContent(content);
     const packet = await this.deserializer.deserialize(rawMessage, properties);
-    const pattern = isString(packet.pattern)
-      ? packet.pattern
-      : JSON.stringify(packet.pattern);
+    const pattern = this.getPatternAsString(packet.pattern);
 
     const rmqContext = new RmqContext([message, channel, pattern]);
     if (isUndefined((packet as IncomingRequest).id)) {
@@ -326,24 +350,19 @@ export class ServerRMQ extends Server<RmqEvents, RmqStatus> {
         rmqContext,
       );
     }
-    return this.onProcessingStartHook(
-      this.transportId,
+    const publish = <T>(data: T) =>
+      this.sendMessage(
+        data,
+        properties.replyTo,
+        properties.correlationId,
+        rmqContext,
+      );
+
+    return this.handleRequest(
       rmqContext,
-      async () => {
-        const response$ = this.transformToObservable(
-          await handler(packet.data, rmqContext),
-        );
-
-        const publish = <T>(data: T) =>
-          this.sendMessage(
-            data,
-            properties.replyTo,
-            properties.correlationId,
-            rmqContext,
-          );
-
-        response$ && this.send(response$, publish);
-      },
+      async () =>
+        this.transformToObservable(await handler(packet.data, rmqContext)),
+      publish,
     );
   }
 
@@ -375,7 +394,6 @@ export class ServerRMQ extends Server<RmqEvents, RmqStatus> {
     const buffer = Buffer.from(JSON.stringify(outgoingResponse));
     const sendOptions = { correlationId, ...options };
 
-    this.onProcessingEndHook?.(this.transportId, context);
     this.channel!.sendToQueue(replyTo, buffer, sendOptions);
   }
 

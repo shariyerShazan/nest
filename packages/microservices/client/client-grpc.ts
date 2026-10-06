@@ -259,7 +259,7 @@ export class ClientGrpcProxy
           const upstreamSubscription: Subscription =
             upstreamSubjectOrData.subscribe(
               (val: unknown) => call.write(val),
-              (err: unknown) => call.emit('error', err),
+              (err: unknown) => observer.error(this.serializeError(err)),
               () => call.end(),
             );
 
@@ -339,6 +339,9 @@ export class ClientGrpcProxy
 
     if (packageName) {
       for (const name of packageName.split('.')) {
+        if (!pkg) {
+          break;
+        }
         pkg = pkg[name];
       }
     }
@@ -370,9 +373,7 @@ export class ClientGrpcProxy
   }
 
   protected getClient(name: string): any {
-    return this.grpcClients.find(client =>
-      Object.hasOwnProperty.call(client, name),
-    );
+    return this.grpcClients.find(client => Object.hasOwn(client, name));
   }
 
   protected publish(packet: any, callback: (packet: any) => any): any {
